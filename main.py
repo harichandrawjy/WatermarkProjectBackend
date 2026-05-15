@@ -36,12 +36,13 @@ sys.path.insert(0, str(ENGINE_DIR))
 from watermark_engine import embed_image, verify_image, SPATIAL_BLOCK
 from video_watermark import embed_video, verify_video
 
+from db import supabase
+
 # ── Storage layout ──
 STORAGE_DIR = Path(__file__).resolve().parent / "storage"
 UPLOAD_DIR  = STORAGE_DIR / "uploads"
 OUTPUT_DIR  = STORAGE_DIR / "outputs"
-META_DIR    = STORAGE_DIR / "metadata"
-for d in (STORAGE_DIR, UPLOAD_DIR, OUTPUT_DIR, META_DIR):
+for d in (STORAGE_DIR, UPLOAD_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
@@ -164,9 +165,13 @@ async def encode(
         out_path = OUTPUT_DIR / f"{file_id}_wm.mkv"
         meta     = embed_video(str(in_path), str(out_path), owner, media_id)
 
-    meta_path = META_DIR / f"{file_id}_meta.json"
     meta_jsonable = _to_jsonable(meta)
-    meta_path.write_text(json.dumps(meta_jsonable, indent=2))
+    supabase.table("watermarks").insert({
+        "id":       file_id,
+        "owner":    owner,
+        "kind":     kind,
+        "metadata": meta_jsonable,
+    }).execute()
 
     return {
         "id":              file_id,
@@ -180,10 +185,10 @@ async def encode(
 
 @app.get("/metadata/{file_id}")
 def get_metadata(file_id: str):
-    meta_path = META_DIR / f"{file_id}_meta.json"
-    if not meta_path.exists():
+    res = supabase.table("watermarks").select("metadata").eq("id", file_id).execute()
+    if not res.data:
         raise HTTPException(404, "Metadata not found")
-    return json.loads(meta_path.read_text())
+    return res.data[0]["metadata"]
 
 
 @app.post("/verify")
