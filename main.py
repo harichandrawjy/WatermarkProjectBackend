@@ -179,7 +179,7 @@ async def encode(
         "watermarked_url": f"/files/{out_path.name}",
         "metadata_url":    f"/metadata/{file_id}",
         "metadata":        meta_jsonable,
-        "psnr_db":         meta.get("psnr_db"),
+        "psnr_db":         meta.get("psnr_db") or meta.get("psnr_y_mean_db"),
     }
 
 
@@ -214,7 +214,7 @@ async def verify(
         verdict    = verify_image(img, meta)
         return _shape_image_response(verdict, file.filename, img_w, img_h)
     else:
-        verdict = verify_video(str(in_path), meta, sample_frames=30)
+        verdict = verify_video(str(in_path), meta, sample_frames=None)
         return _shape_video_response(verdict, file.filename)
 
 
@@ -246,14 +246,30 @@ def _shape_video_response(v: dict, filename: str) -> dict:
     elif temporal is None:
         temporal = []
 
-    frame_results = [
-        {
-            "frame":      i,
-            "status":     "tampered" if t else "authentic",
-            "confidence": 0.5 if t else 0.95,
-        }
-        for i, t in enumerate(temporal)
-    ]
+    spatial_arr = v.get("spatial_tamper_map")
+    per_frame   = v.get("per_frame", []) or []
+
+    frame_results = []
+    for i, t in enumerate(temporal):
+        per_frame_map = None
+        if spatial_arr is not None and hasattr(spatial_arr, "shape") \
+                and spatial_arr.ndim == 3 and i < spatial_arr.shape[0]:
+            per_frame_map = spatial_arr[i]
+        true_frame_idx = per_frame[i].get("frame_idx", i) if i < len(per_frame) else i
+        frame_results.append({
+            "frame":           int(true_frame_idx),
+            "status":          "tampered" if t else "authentic",
+            "confidence":      0.5 if t else 0.95,
+            "tamperedRegions": _spatial_to_regions(per_frame_map),
+        })
+
+    # Pixel dimensions derived from the spatial block grid so the frontend
+    # heatmap scales correctly per video.
+    video_w = video_h = None
+    if spatial_arr is not None and hasattr(spatial_arr, "shape") and spatial_arr.ndim == 3:
+        _, Hb, Wb = spatial_arr.shape
+        video_h = int(Hb * SPATIAL_BLOCK)
+        video_w = int(Wb * SPATIAL_BLOCK)
 
     return {
         "status":          "tampered" if v["TAMPERED"] else "authentic",
@@ -264,6 +280,8 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         "fileName":        filename,
         "tamperedRegions": [],
         "frameResults":    frame_results,
+        "imageWidth":      video_w,
+        "imageHeight":     video_h,
         "framesChecked":   int(v["frames_checked"]),
         "framesTampered":  int(v["frames_tampered"]),
         "frameTamperRate": float(v.get("frame_tamper_rate", 0.0)),

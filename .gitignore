@@ -10,3 +10,6 @@ __pycache__/
 
 # Runtime storage
 storage/
+
+# Local env file (contains secrets)
+.env

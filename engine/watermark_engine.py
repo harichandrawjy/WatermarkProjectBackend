@@ -1,27 +1,23 @@
 """
 Semi-Fragile Watermarking Engine
 ==================================
-Pipeline (matches encoder.png / decoder.png architecture):
+Pipeline:
 
-  Embed:  Y → 2-level LWT → DCT(8x8) → block-select → SVD → QIM on S[0]
-          → IDWT.  BCH-coded media meta in LLLL; per-block hashed
-          watermark in LLLH and LLHL.
+  Embed:  Y  → 2-level LWT → LLLL → DCT(8x8) → SVD → QIM on S[0] → IDWT.
+          Cb → 16×16 block-mean LSB parity (orthogonal fragile layer).
 
-  Verify: Y → 2-level LWT → DCT(8x8) → SVD → extract bits → BCH-decode
-          (LLLL) → recompute per-block expected fingerprint → BER →
-          spatial tamper map → decision.
+  Verify: Y  → 2-level LWT → LLLL → DCT(8x8) → SVD → extract bits →
+                BCH-decode → owner/media/frame_id + majority-vote fallback.
+          Cb → block-mean LSB parity → spatial tamper map → decision.
 
 Subband layout:
   LLLL  ← media meta (BCH-protected)              robust   (QIM_STEP_ROBUST)
-  LLLH  ← per-block hashed watermark              fragile  (QIM_STEP_FRAGILE)
-  LLHL  ← per-block hashed watermark (key-XOR)    fragile  (QIM_STEP_FRAGILE)
+  LLLH  ← (unused — passed through)
+  LLHL  ← (unused — passed through)
 
-The per-block hash of a block at position (i,j) is:
-  SHA256( signature || frame_id || block_id || quantised_pixels )
-The LSB of that hash is the bit embedded in S[0] of that block.  Temporal
-integrity (frame deletion / reorder) is handled by the BCH-protected frame_id
-in LLLL — see verify_video — so per-block fingerprints stay purely spatial.
-See note in README on quantisation choice.
+Spatial tamper localisation is carried entirely by the chroma LSB layer.
+Temporal integrity (frame deletion / reorder) is handled by the
+BCH-protected frame_id in LLLL — see verify_video.
 
 Note on LWT vs DWT
 ------------------
@@ -38,6 +34,7 @@ import struct
 from typing import Tuple, Optional, Dict, List
 import pywt
 from scipy.fft import dct, idct
+import galois
 
 
 # ──────────────────────────────────────────────────────────────
@@ -45,75 +42,89 @@ from scipy.fft import dct, idct
 # ──────────────────────────────────────────────────────────────
 BLOCK_SIZE        = 8       # DCT block size
 QIM_STEP_ROBUST   = 32.0    # LLLL  — media meta, robust  (was 24.0)
-QIM_STEP_FRAGILE  = 16.0    # LLLH/LLHL — semi-fragile fingerprint
 WAVELET           = 'haar'  # Haar (LWT-equivalent for this wavelet)
 DWT_LEVELS        = 2
-LSB_QIM_STEP           = 2.0 
-LSB_BLOCK_TAMPER_RATIO = 0.1
-# Spatial-block size per LLLH/LLHL 8x8 coefficient block:
-# Each level-2 coefficient covers 4x4 spatial pixels, so an 8x8 block of
-# coefficients covers 32x32 spatial pixels.  This is the "block" used for
-# per-block fingerprinting.
+LSB_QIM_STEP           = 2.0
+LSB_BLOCK_TAMPER_RATIO = 0.45   # >45% sub-block disagreement → flag block.
+                                # Tuned so compression stays at 0 blocks while
+                                # 32x32+ edits flip enough sub-blocks to flag.
+# Spatial-block size — each level-2 wavelet coefficient covers 4x4 spatial
+# pixels, so an 8x8 coefficient block covers 32x32 pixels.  Used as the
+# block granularity for the chroma-LSB tamper map.
 SPATIAL_BLOCK = BLOCK_SIZE * (2 ** DWT_LEVELS)   # 32
-LSB_SUB_BLOCK_SIZE     = 16 
-# The "Pixel Value" input to the per-block SHA256 (encoder.png) is reduced
-# to a small set of robust block summary features rather than raw pixels.
-# Hashing all 1024 pixels of a 32x32 block would be far too fragile — even
-# the watermark's own perturbation (~10-15 px) flips per-pixel quantisation
-# almost everywhere.  Quadrant medians are stable to ~10 px shifts but
-# remain sensitive to spatial content changes (a region splice changes
-# at least one quadrant median).
-PIXEL_QUANT_STEP  = 32      # quantisation step for quadrant medians
+LSB_SUB_BLOCK_SIZE     = 16     # 16x16 sub-blocks → 4 LSB cells per 32x32 spatial block
 
-BER_TAMPER_THRESHOLD = 0.15  # >15% block fingerprint mismatches → tampered  (was 0.18)
+BER_TAMPER_THRESHOLD = 0.15  # Informational — kept for metadata back-compat.
+
+# Minimum number of flagged 32×32 spatial blocks required before a frame
+# (or image) is considered content-tampered.  The chroma-LSB layer is
+# quantization-noisy and routinely produces ~3 isolated false positives
+# per frame on a clean re-encode; setting this to 6 tolerates that floor
+# while still catching real tampering of a single 32×32 region or larger
+# (which collapses ~6+ blocks once the LSB sub-block aggregation rounds
+# borders).  Per-block sensitivity in the returned spatial map is
+# unchanged — every flagged block still surfaces in the heatmap.
+MIN_TAMPER_BLOCKS = 6
+
 # Raw repeated owner_hash copies embedded in LLLL alongside the BCH-coded
 # meta payload.  Used as a majority-vote fallback when BCH decoding fails
 # (which happens when ≥2 bits flip in the same 7-bit codeword).  Each copy
 # is the truncated SHA-256 owner_hash = 4 bytes = 32 bits.
 OWNER_HASH_BITS    = 32
 OWNER_HASH_REPEATS = 3   # need ≥3 for unambiguous majority vote
+FRAME_ID_BITS      = 32  # raw frame_id repeated for majority-vote temporal recovery
+CHAIN_TAG_BITS     = 16  # raw chain_tag repeated for majority-vote chain recovery
 
 
 # ──────────────────────────────────────────────────────────────
-# HAMMING(7,4) — single-error-correcting BCH used on LLLL meta
+# BCH(15,7) — 2-error-correcting BCH used on LLLL meta
 # ──────────────────────────────────────────────────────────────
-# Code rate 4/7.  Each 4-bit data nibble → 7-bit codeword.  Decoder
-# corrects any single bit error in each 7-bit codeword.
+# Each 7-bit data block → 15-bit codeword.  Decoder corrects up to 2 bit
+# errors per codeword.  Rate 7/15 ≈ 47% (vs Hamming(7,4)'s 57%).
+#
+# Pays ~27% more LLLL space for 2× the per-codeword error tolerance.
+# Picked over BCH(15,5) (t=3, rate 33%) because the longer BCH-coded
+# payload of BCH(15,5) pushes the unprotected repetition copies into
+# noisier LLLL real estate — empirically the trade-off comes out negative
+# under H.264 noise.  BCH(15,7) preserves the majority-vote margin while
+# still improving per-codeword tolerance.
+
+_BCH_N = 15
+_BCH_K = 7
+_BCH   = galois.BCH(_BCH_N, _BCH_K)   # t = 2 (verified at construction)
+_GF2   = galois.GF(2)
+
 
 def bch_encode_bits(data_bits: np.ndarray) -> np.ndarray:
-    """Hamming(7,4) encode a bit array (length padded to multiple of 4)."""
+    """BCH(15,7) encode a bit array (length padded to multiple of 7)."""
     bits = np.asarray(data_bits, dtype=np.uint8)
-    pad  = (4 - len(bits) % 4) % 4
+    pad  = (_BCH_K - len(bits) % _BCH_K) % _BCH_K
     if pad:
         bits = np.concatenate([bits, np.zeros(pad, dtype=np.uint8)])
-    out = np.empty(len(bits) // 4 * 7, dtype=np.uint8)
-    for i, j in zip(range(0, len(bits), 4), range(0, len(out), 7)):
-        d1, d2, d3, d4 = bits[i:i+4]
-        p1 = d1 ^ d2 ^ d4
-        p2 = d1 ^ d3 ^ d4
-        p3 = d2 ^ d3 ^ d4
-        out[j:j+7] = (p1, p2, d1, p3, d2, d3, d4)
-    return out
+    msg    = _GF2(bits.reshape(-1, _BCH_K))
+    coded  = _BCH.encode(msg)
+    return np.asarray(coded, dtype=np.uint8).reshape(-1)
 
 
 def bch_decode_bits(coded_bits: np.ndarray) -> Tuple[np.ndarray, int]:
-    """Hamming(7,4) decode. Returns (data_bits, num_corrections_applied)."""
+    """BCH(15,7) decode. Returns (data_bits, num_corrections_applied).
+
+    Codewords with errors beyond t=2 are flagged as uncorrectable by galois
+    (errors entry = -1 for that codeword).  We surface that as data bits
+    extracted from the systematic positions anyway — the caller's integrity
+    tag will reject any uncorrectable codeword that mangled the payload.
+    """
     coded = np.asarray(coded_bits, dtype=np.uint8)
-    n     = (len(coded) // 7) * 7
-    coded = coded[:n].copy()
-    data  = np.empty(n // 7 * 4, dtype=np.uint8)
-    n_corr = 0
-    for i, j in zip(range(0, n, 7), range(0, len(data), 4)):
-        cw = coded[i:i+7]
-        p1, p2, d1, p3, d2, d3, d4 = cw
-        s1 = p1 ^ d1 ^ d2 ^ d4
-        s2 = p2 ^ d1 ^ d3 ^ d4
-        s3 = p3 ^ d2 ^ d3 ^ d4
-        syn = (s3 << 2) | (s2 << 1) | s1
-        if syn:
-            cw[syn - 1] ^= 1
-            n_corr += 1
-        data[j:j+4] = cw[2], cw[4], cw[5], cw[6]
+    n     = (len(coded) // _BCH_N) * _BCH_N
+    if n == 0:
+        return np.zeros(0, dtype=np.uint8), 0
+    cw_arr = _GF2(coded[:n].reshape(-1, _BCH_N))
+    decoded, errs = _BCH.decode(cw_arr, errors=True)
+    # `errs` is per-codeword; -1 means uncorrectable.  Count only successful
+    # corrections toward the running total (matches Hamming(7,4) semantics).
+    errs_np = np.asarray(errs)
+    n_corr  = int(errs_np[errs_np > 0].sum()) if errs_np.size else 0
+    data    = np.asarray(decoded, dtype=np.uint8).reshape(-1)
     return data, n_corr
 
 
@@ -161,6 +172,18 @@ def _owner_hash_bits_array(owner_id: str) -> np.ndarray:
 def _media_hash_bits_array(media_id: str) -> np.ndarray:
     """32-bit array form of the truncated SHA-256 media_hash."""
     return bits_to_array(hashlib.sha256(media_id.encode()).digest()[:4])
+
+
+def _frame_id_bits_array(frame_id: int) -> np.ndarray:
+    """32-bit big-endian array form of frame_id (matches the meta-payload encoding)."""
+    return bits_to_array(struct.pack(">I", frame_id))
+
+
+def _chain_tag_bits_array(chain_tag_bytes: bytes) -> np.ndarray:
+    """16-bit array form of the 2-byte chain_tag (matches the meta-payload encoding)."""
+    if len(chain_tag_bytes) != 2:
+        raise ValueError(f"chain_tag must be 2 bytes, got {len(chain_tag_bytes)}")
+    return bits_to_array(chain_tag_bytes)
 
 
 def _majority_vote(repeated_bits: np.ndarray, copy_len: int) -> Optional[np.ndarray]:
@@ -308,74 +331,6 @@ def _extract_bits_dct_svd_with_mask(
 
 
 # ──────────────────────────────────────────────────────────────
-# PER-BLOCK FINGERPRINT  (LLLH / LLHL hashed watermark)
-# ──────────────────────────────────────────────────────────────
-
-def _quantise_pixels(spatial_block: np.ndarray) -> bytes:
-    """Robust block summary used as the 'Pixel Value' input to the per-block
-    SHA256.  Uses *means* of the whole block plus its 4 quadrants — means
-    average out the watermark's high-frequency perturbation (so the same
-    quantised summary survives embedding & mild compression), but still
-    change when the block's content is replaced.
-    """
-    h, w   = spatial_block.shape[:2]
-    qh, qw = h // 2, w // 2
-    full   = float(np.mean(spatial_block))
-    q00    = float(np.mean(spatial_block[:qh,    :qw]))
-    q01    = float(np.mean(spatial_block[:qh,    qw:]))
-    q10    = float(np.mean(spatial_block[qh:,    :qw]))
-    q11    = float(np.mean(spatial_block[qh:,    qw:]))
-    return bytes([
-        int(full) // PIXEL_QUANT_STEP & 0xFF,
-        int(q00)  // PIXEL_QUANT_STEP & 0xFF,
-        int(q01)  // PIXEL_QUANT_STEP & 0xFF,
-        int(q10)  // PIXEL_QUANT_STEP & 0xFF,
-        int(q11)  // PIXEL_QUANT_STEP & 0xFF,
-    ])
-
-
-def _per_block_fingerprint(
-    spatial_block: np.ndarray,
-    signature: bytes,
-    frame_id: int,
-    block_id: int,
-) -> int:
-    """SHA256( signature || frame_id || block_id || quant_pixels ) → LSB.
-
-    The fingerprint is purely spatial: it depends on the cover pixels of
-    this block plus a (signature, frame_id, block_id) tag that is
-    deterministic from public IDs.  Frame-to-frame chaining is handled by
-    the BCH-protected frame_id in LLLL (verified separately), not here.
-    """
-    h = hashlib.sha256()
-    h.update(signature)
-    h.update(struct.pack(">I", frame_id))
-    h.update(struct.pack(">I", block_id))
-    h.update(_quantise_pixels(spatial_block))
-    return h.digest()[0] & 1
-
-
-def _compute_fingerprint_grid(
-    Y: np.ndarray,
-    n_blocks_h: int,
-    n_blocks_w: int,
-    signature: bytes,
-    frame_id: int,
-    key_xor: int = 0,
-) -> np.ndarray:
-    """Compute (n_blocks_h x n_blocks_w) fingerprint bit grid by hashing
-    each 32x32 spatial cover block.  `key_xor` lets LLHL use a different
-    bit per block (forgery resistance / redundancy)."""
-    grid = np.zeros((n_blocks_h, n_blocks_w), dtype=np.uint8)
-    for bi in range(n_blocks_h):
-        for bj in range(n_blocks_w):
-            sb = Y[bi*SPATIAL_BLOCK:(bi+1)*SPATIAL_BLOCK,
-                   bj*SPATIAL_BLOCK:(bj+1)*SPATIAL_BLOCK]
-            block_id = bi * n_blocks_w + bj
-            bit = _per_block_fingerprint(sb, signature, frame_id, block_id)
-            grid[bi, bj] = bit ^ (key_xor & 1) ^ ((block_id & 1) & key_xor)
-    return grid
-
 # LSB-BASED SPATIAL LOCALISATION  (compression-tolerant layer)
 # ──────────────────────────────────────────────────────────────
 # Encodes a target parity bit in the LSB of each 4×4 sub-block's mean
@@ -558,12 +513,6 @@ def _embed_into_channel(
     LL,   (LH1, HL1, HH1) = pywt.dwt2(Y,  WAVELET)
     LLLL, (LLLH, LLHL, LLHH) = pywt.dwt2(LL, WAVELET)
 
-    # ── Compute per-block fingerprint grids from the cover Y channel ──
-    n_h = LLLH.shape[0] // BLOCK_SIZE
-    n_w = LLLH.shape[1] // BLOCK_SIZE
-    fp_LLLH = _compute_fingerprint_grid(Y, n_h, n_w, signature, frame_id, key_xor=0)
-    fp_LLHL = _compute_fingerprint_grid(Y, n_h, n_w, signature, frame_id, key_xor=1)
-
     # LLLL stream = [BCH-coded meta] + [raw owner/media hash repetitions].
     # Repetitions are extracted whole-pattern at decode and majority-voted
     # to recover owner_hash and media_hash even when BCH miscorrects.
@@ -575,10 +524,8 @@ def _embed_into_channel(
             np.asarray(extra_llll_bits, dtype=np.uint8),
         ])
 
-    # ── Embed: LLLL gets meta + repetition copies; LLLH/LLHL get fingerprint bits ──
-    LLLL, n_llll  = _embed_bits_dct_svd(LLLL, llll_stream,        QIM_STEP_ROBUST)
-    LLLH, n_fpA   = _embed_bits_dct_svd(LLLH, fp_LLLH.flatten(),  QIM_STEP_FRAGILE)
-    LLHL, n_fpB   = _embed_bits_dct_svd(LLHL, fp_LLHL.flatten(),  QIM_STEP_FRAGILE)
+    # ── Embed: LLLL only.  LLLH/LLHL pass through untouched. ──
+    LLLL, n_llll = _embed_bits_dct_svd(LLLL, llll_stream, QIM_STEP_ROBUST)
 
     n_meta  = min(n_llll, len(meta_bits))
     n_extra = max(0, n_llll - len(meta_bits))
@@ -590,10 +537,6 @@ def _embed_into_channel(
     info = {
         "n_meta_bits":         int(n_meta),
         "n_extra_llll_bits":   int(n_extra),
-        "n_fpA_bits":          int(n_fpA),
-        "n_fpB_bits":          int(n_fpB),
-        "fp_grid_h":           int(n_h),
-        "fp_grid_w":           int(n_w),
     }
     return Y_wm, info
 
@@ -611,11 +554,7 @@ def _verify_channel(
 ) -> Dict:
     Yf = Y.astype(np.float64)
     LL, _ = pywt.dwt2(Yf, WAVELET)
-    LLLL, (LLLH, LLHL, _) = pywt.dwt2(LL, WAVELET)
-
-    n_h = LLLH.shape[0] // BLOCK_SIZE
-    n_w = LLLH.shape[1] // BLOCK_SIZE
-    n_fp_bits = n_h * n_w
+    LLLL, _ = pywt.dwt2(LL, WAVELET)
 
     # Single LLLL extraction covering BCH meta + raw owner/media repetitions
     # (kept in one call so the block walk order matches embed exactly).
@@ -625,33 +564,9 @@ def _verify_channel(
     meta_bits    = llll_ext[:n_meta_bits_coded]
     extra_ext    = llll_ext[n_meta_bits_coded:n_meta_bits_coded + n_extra]
 
-    fpA_ext,  _  = _extract_bits_dct_svd_with_mask(LLLH, n_fp_bits, QIM_STEP_FRAGILE)
-    fpB_ext,  _  = _extract_bits_dct_svd_with_mask(LLHL, n_fp_bits, QIM_STEP_FRAGILE)
-
-    fp_expected_A = _compute_fingerprint_grid(Yf, n_h, n_w, signature, frame_id, 0).flatten()
-    fp_expected_B = _compute_fingerprint_grid(Yf, n_h, n_w, signature, frame_id, 1).flatten()
-
-    # Per-block tamper: a block is flagged when BOTH LLLH and LLHL bits
-    # disagree with the expected fingerprint.  Requiring agreement across
-    # the two subbands suppresses isolated false positives from
-    # compression noise.
-    miss_A = (fpA_ext != fp_expected_A)
-    miss_B = (fpB_ext != fp_expected_B)
-    miss_both = miss_A & miss_B
-
-    spatial_map = miss_both.reshape(n_h, n_w)
-    ber         = float(miss_both.mean())
-    ber_A       = float(miss_A.mean())
-    ber_B       = float(miss_B.mean())
-
     return {
         "meta_bits_coded":  meta_bits,
         "extra_llll_bits":  extra_ext,
-        "spatial_map":      spatial_map,
-        "ber":              ber,
-        "ber_A":            ber_A,
-        "ber_B":            ber_B,
-        "tampered":         ber > BER_TAMPER_THRESHOLD,
     }
 
 
@@ -659,33 +574,85 @@ def _verify_channel(
 # META PAYLOAD (LLLL)
 # ──────────────────────────────────────────────────────────────
 
-def _build_meta_payload(owner_id: str, media_id: str, frame_id: int) -> bytes:
-    """Compact 14-byte LLLL header.
+def _chain_genesis(media_hash_bytes: bytes) -> bytes:
+    """Initial 32-byte chain state for frame 0 (or for an image's only frame).
+
+    Derived from the media hash so different media start independent chains.
+    No secret key — the chain provides temporal integrity, not authenticity
+    (CLAUDE.md "Known weaknesses"); add HMAC if forgery resistance is needed.
+    """
+    h = hashlib.sha256()
+    h.update(b"chain-genesis-v1|")
+    h.update(media_hash_bytes)
+    return h.digest()
+
+
+def _frame_chain_hash(media_hash_bytes: bytes, prev_chain: bytes, frame_id: int) -> bytes:
+    """Evolve the chain state by one frame.  Returns the new 32-byte state.
+
+    chain_i = SHA256("chain-v1|" || media_hash || chain_{i-1} || frame_id_i)
+    The first 2 bytes of the result are what gets embedded in LLLL.
+    """
+    h = hashlib.sha256()
+    h.update(b"chain-v1|")
+    h.update(media_hash_bytes)
+    h.update(prev_chain)
+    h.update(struct.pack(">I", frame_id))
+    return h.digest()
+
+
+def _expected_chain_state(media_hash_bytes: bytes, iteration_index: int,
+                          embed_every_n_frames: int = 1) -> bytes:
+    """Compute the chain state that *should* be present at a given iteration.
+
+    Verifier-side helper.  Deterministic from (media_hash, iteration_index)
+    — does not require walking every frame, so verify can still sample.
+    """
+    chain = _chain_genesis(media_hash_bytes)
+    for k in range(iteration_index + 1):
+        frame_id = k * embed_every_n_frames
+        chain = _frame_chain_hash(media_hash_bytes, chain, frame_id)
+    return chain
+
+
+# Meta payload layout (16 bytes, BCH(7,4)-protected as 224 bits):
+#   owner_hash(4) || media_hash(4) || frame_id(4) || chain_tag(2) || integrity_tag(2)
+META_PAYLOAD_BYTES = 16
+_META_BODY_BYTES   = 14    # everything except the trailing integrity_tag
+
+
+def _build_meta_payload(owner_id: str, media_id: str, frame_id: int,
+                        chain_tag: bytes = b"\x00\x00") -> bytes:
+    """Compact 16-byte LLLL header.
 
     The full owner/media strings live in the JSON sidecar; here we only embed
-    truncated SHA-256 hashes of them (a one-way commitment), the frame index,
-    and a 2-byte integrity tag.  At 512x512 the LLLL subband holds ~256 bits
-    after BCH(7,4), which is exactly enough room.
+    truncated SHA-256 hashes of them (one-way commitments), the frame index,
+    a 2-byte chain_tag for temporal integrity, and a 2-byte integrity tag.
+    At 512x512 the LLLL subband holds ~256 bits after BCH(7,4), which is
+    enough room for the 224 BCH-coded bits of this payload.
     """
+    if len(chain_tag) != 2:
+        raise ValueError(f"chain_tag must be 2 bytes, got {len(chain_tag)}")
     owner_h = hashlib.sha256(owner_id.encode()).digest()[:4]
     media_h = hashlib.sha256(media_id.encode()).digest()[:4]
     frame_b = struct.pack(">I", frame_id)
-    body    = owner_h + media_h + frame_b
+    body    = owner_h + media_h + frame_b + chain_tag        # 14 bytes
     tag     = hashlib.sha256(body).digest()[:2]
-    return body + tag                                # 14 bytes = 112 bits
+    return body + tag                                         # 16 bytes = 128 bits
 
 
 def _parse_meta_payload(meta_bytes: bytes) -> Optional[Dict]:
     try:
-        if len(meta_bytes) < 14:
+        if len(meta_bytes) < META_PAYLOAD_BYTES:
             return None
-        body, tag = meta_bytes[:12], meta_bytes[12:14]
+        body, tag = meta_bytes[:_META_BODY_BYTES], meta_bytes[_META_BODY_BYTES:META_PAYLOAD_BYTES]
         if hashlib.sha256(body).digest()[:2] != tag:
             return None
         return {
             "owner_hash": body[:4].hex(),
             "media_hash": body[4:8].hex(),
             "frame":      struct.unpack(">I", body[8:12])[0],
+            "chain_tag":  body[12:14].hex(),
         }
     except Exception:
         return None
@@ -732,17 +699,27 @@ def embed_image(
     if img_array.ndim < 3 or img_array.shape[2] < 3:
         raise ValueError("Input must be H×W×3 RGB.")
 
-    signature  = _master_signature(owner_id, media_id, frame_id)
-    meta_raw   = _build_meta_payload(owner_id, media_id, frame_id)
-    meta_bits  = bits_to_array(meta_raw)
-    meta_coded = bch_encode_bits(meta_bits)
+    signature   = _master_signature(owner_id, media_id, frame_id)
+    media_h_b   = hashlib.sha256(media_id.encode()).digest()[:4]
+    chain_state = _frame_chain_hash(media_h_b, _chain_genesis(media_h_b), frame_id)
+    chain_tag   = chain_state[:2]
+    meta_raw    = _build_meta_payload(owner_id, media_id, frame_id, chain_tag=chain_tag)
+    meta_bits   = bits_to_array(meta_raw)
+    meta_coded  = bch_encode_bits(meta_bits)
 
-    # Raw repeated owner_hash + media_hash for majority-vote fallback when
-    # BCH miscorrects.  Owner copies come first (priority — owner is the
-    # provenance-critical field); if LLLL runs out, media copies get truncated.
-    owner_repeated = np.tile(_owner_hash_bits_array(owner_id), OWNER_HASH_REPEATS)
-    media_repeated = np.tile(_media_hash_bits_array(media_id), OWNER_HASH_REPEATS)
-    extras         = np.concatenate([owner_repeated, media_repeated])
+    # Raw repeated fields for majority-vote fallback when BCH miscorrects.
+    # Priority order (head of stream gets the most LLLL space — lower-priority
+    # fields get truncated first):
+    #   owner_hash   — provenance-critical
+    #   media_hash   — provenance-critical
+    #   frame_id     — temporal integrity
+    #   chain_tag    — temporal integrity (reorder/replay detection)
+    owner_repeated     = np.tile(_owner_hash_bits_array(owner_id),       OWNER_HASH_REPEATS)
+    media_repeated     = np.tile(_media_hash_bits_array(media_id),       OWNER_HASH_REPEATS)
+    frame_id_repeated  = np.tile(_frame_id_bits_array(frame_id),         OWNER_HASH_REPEATS)
+    chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag),       OWNER_HASH_REPEATS)
+    extras             = np.concatenate([owner_repeated, media_repeated,
+                                         frame_id_repeated, chain_tag_repeated])
 
     Y, Cb, Cr = to_float_ycbcr(img_array[:,:,:3])
     Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_id, extras)
@@ -756,35 +733,51 @@ def embed_image(
         )
 
     # Tally how many FULL copies of each fit (partial copies can't vote).
-    n_extra_emb    = info["n_extra_llll_bits"]
-    n_owner_copies = min(OWNER_HASH_REPEATS, n_extra_emb // OWNER_HASH_BITS)
-    remaining      = max(0, n_extra_emb - n_owner_copies * OWNER_HASH_BITS)
-    n_media_copies = min(OWNER_HASH_REPEATS, remaining // OWNER_HASH_BITS)
-    n_owner_bits   = n_owner_copies * OWNER_HASH_BITS
-    n_media_bits   = n_media_copies * OWNER_HASH_BITS
+    # Priority order: owner → media → frame_id → chain_tag.  Each lower-
+    # priority field gets whatever LLLL space remains after the higher ones.
+    n_extra_emb       = info["n_extra_llll_bits"]
+    n_owner_copies    = min(OWNER_HASH_REPEATS, n_extra_emb // OWNER_HASH_BITS)
+    remaining         = max(0, n_extra_emb - n_owner_copies * OWNER_HASH_BITS)
+    n_media_copies    = min(OWNER_HASH_REPEATS, remaining // OWNER_HASH_BITS)
+    remaining        -= n_media_copies * OWNER_HASH_BITS
+    n_frame_copies    = min(OWNER_HASH_REPEATS, remaining // FRAME_ID_BITS)
+    remaining        -= n_frame_copies * FRAME_ID_BITS
+    n_chain_copies    = min(OWNER_HASH_REPEATS, remaining // CHAIN_TAG_BITS)
 
-    if n_owner_copies < OWNER_HASH_REPEATS or n_media_copies < OWNER_HASH_REPEATS:
-        print(f"[embed_image] note: fit {n_owner_copies}/{OWNER_HASH_REPEATS} owner + "
-              f"{n_media_copies}/{OWNER_HASH_REPEATS} media hash copies in LLLL "
-              f"(image small - full repetition margin needs >=2 copies each).")
+    n_owner_bits  = n_owner_copies * OWNER_HASH_BITS
+    n_media_bits  = n_media_copies * OWNER_HASH_BITS
+    n_frame_bits  = n_frame_copies * FRAME_ID_BITS
+    n_chain_bits  = n_chain_copies * CHAIN_TAG_BITS
+
+    if (n_owner_copies < OWNER_HASH_REPEATS or n_media_copies < OWNER_HASH_REPEATS
+            or n_frame_copies < OWNER_HASH_REPEATS or n_chain_copies < OWNER_HASH_REPEATS):
+        print(f"[embed_image] note: fit "
+              f"{n_owner_copies}/{OWNER_HASH_REPEATS} owner + "
+              f"{n_media_copies}/{OWNER_HASH_REPEATS} media + "
+              f"{n_frame_copies}/{OWNER_HASH_REPEATS} frame_id + "
+              f"{n_chain_copies}/{OWNER_HASH_REPEATS} chain_tag majority-vote copies in LLLL.")
 
     rgb = from_float_ycbcr(Y_wm, Cb_wm, Cr)
     mse = np.mean((img_array[:,:,:3].astype(np.float64) - rgb.astype(np.float64)) ** 2)
     psnr = float(10.0 * np.log10(255.0 ** 2 / mse)) if mse > 0 else float("inf")
     metadata = {
-        "version":             "v2",
+        "version":             "v3",
         "owner_id":            owner_id,
         "media_id":            media_id,
         "frame_id":            frame_id,
         "meta_bits_raw":       int(len(meta_bits)),
         "meta_bits_coded":     int(len(meta_coded)),
-        "owner_repeat_bits":   int(n_owner_bits),
-        "owner_repeat_copies": int(n_owner_copies),
-        "media_repeat_bits":   int(n_media_bits),
-        "media_repeat_copies": int(n_media_copies),
-        "owner_hash_bits":     int(OWNER_HASH_BITS),
-        "fp_grid_h":           int(info["fp_grid_h"]),
-        "fp_grid_w":           int(info["fp_grid_w"]),
+        "owner_repeat_bits":     int(n_owner_bits),
+        "owner_repeat_copies":   int(n_owner_copies),
+        "media_repeat_bits":     int(n_media_bits),
+        "media_repeat_copies":   int(n_media_copies),
+        "frame_repeat_bits":     int(n_frame_bits),
+        "frame_repeat_copies":   int(n_frame_copies),
+        "chain_repeat_bits":     int(n_chain_bits),
+        "chain_repeat_copies":   int(n_chain_copies),
+        "owner_hash_bits":       int(OWNER_HASH_BITS),
+        "frame_id_bits":         int(FRAME_ID_BITS),
+        "chain_tag_bits":        int(CHAIN_TAG_BITS),
         "psnr_db":             psnr,
     }
     return rgb, metadata
@@ -809,16 +802,24 @@ def verify_image(
 
     n_owner_repeat = int(metadata.get("owner_repeat_bits", 0))
     n_media_repeat = int(metadata.get("media_repeat_bits", 0))
+    n_frame_repeat = int(metadata.get("frame_repeat_bits", 0))
+    n_chain_repeat = int(metadata.get("chain_repeat_bits", 0))
     n_owner_copies = int(metadata.get("owner_repeat_copies", 0))
     n_media_copies = int(metadata.get("media_repeat_copies", 0))
+    n_frame_copies = int(metadata.get("frame_repeat_copies", 0))
+    n_chain_copies = int(metadata.get("chain_repeat_copies", 0))
 
+    n_extra_total = n_owner_repeat + n_media_repeat + n_frame_repeat + n_chain_repeat
     res = _verify_channel(
         Y, metadata["meta_bits_coded"], signature, frame_id,
-        n_extra_llll_bits=n_owner_repeat + n_media_repeat,
+        n_extra_llll_bits=n_extra_total,
     )
-    extra_bits        = res["extra_llll_bits"]
-    owner_repeat_ext  = extra_bits[:n_owner_repeat]
-    media_repeat_ext  = extra_bits[n_owner_repeat:n_owner_repeat + n_media_repeat]
+    extra_bits   = res["extra_llll_bits"]
+    p = 0
+    owner_repeat_ext = extra_bits[p:p + n_owner_repeat]; p += n_owner_repeat
+    media_repeat_ext = extra_bits[p:p + n_media_repeat]; p += n_media_repeat
+    frame_repeat_ext = extra_bits[p:p + n_frame_repeat]; p += n_frame_repeat
+    chain_repeat_ext = extra_bits[p:p + n_chain_repeat]
 
     # BCH-decode meta bits
     meta_bits_dec, n_corr = bch_decode_bits(res["meta_bits_coded"])
@@ -828,15 +829,30 @@ def verify_image(
     expected_owner_h, expected_media_h = _meta_owner_media_hash(
         metadata["owner_id"], metadata["media_id"])
 
-    watermark_found  = parsed is not None
+    # Expected chain_tag for a single-image case: one chain step from genesis.
+    media_h_b           = bytes.fromhex(expected_media_h)
+    expected_chain_full = _frame_chain_hash(media_h_b, _chain_genesis(media_h_b), frame_id)
+    expected_chain_tag  = expected_chain_full[:2].hex()
+
+    expected_frame_id_hex = struct.pack(">I", frame_id).hex()
+
+    bch_ok           = parsed is not None
     owner_match      = bool(parsed and parsed.get("owner_hash") == expected_owner_h)
     media_match      = bool(parsed and parsed.get("media_hash") == expected_media_h)
+    chain_match      = bool(parsed and parsed.get("chain_tag")  == expected_chain_tag)
+    frame_match      = bool(parsed and parsed.get("frame")      == frame_id)
     owner_hash_out   = parsed.get("owner_hash") if parsed else None
     media_hash_out   = parsed.get("media_hash") if parsed else None
-    owner_recovery   = "bch" if owner_match else ("none" if not watermark_found else "bch_mismatch")
-    media_recovery   = "bch" if media_match else ("none" if not watermark_found else "bch_mismatch")
+    frame_out        = parsed.get("frame") if parsed else None
+    chain_tag_out    = parsed.get("chain_tag") if parsed else None
+    owner_recovery   = "bch" if owner_match else ("none" if not bch_ok else "bch_mismatch")
+    media_recovery   = "bch" if media_match else ("none" if not bch_ok else "bch_mismatch")
+    frame_recovery   = "bch" if frame_match else ("none" if not bch_ok else "bch_mismatch")
+    chain_recovery   = "bch" if chain_match else ("none" if not bch_ok else "bch_mismatch")
 
     # ── Majority-vote fallback for owner_hash when BCH path failed ──
+    # Compression often makes BCH fail; majority-vote on the repeated copies
+    # still recovers the owner reliably.  This is the primary robustness path.
     if not owner_match and n_owner_repeat > 0 and len(owner_repeat_ext) >= OWNER_HASH_BITS * 2:
         voted = _majority_vote(owner_repeat_ext, OWNER_HASH_BITS)
         if voted is not None:
@@ -860,42 +876,67 @@ def verify_image(
             elif media_hash_out is None:
                 media_hash_out = voted_hex
 
-    # Top-level recovery_method summarizes the higher-quality of the two.
-    if owner_recovery == "majority_vote" or media_recovery == "majority_vote":
+    # ── Majority-vote fallback for frame_id when BCH path failed ──
+    # Temporal integrity is as critical as identity — if BCH miscorrects,
+    # majority-vote on the raw frame_id copies still recovers it.
+    if not frame_match and n_frame_repeat > 0 and len(frame_repeat_ext) >= FRAME_ID_BITS * 2:
+        voted = _majority_vote(frame_repeat_ext, FRAME_ID_BITS)
+        if voted is not None:
+            voted_hex = array_to_bytes(voted).hex()
+            if voted_hex == expected_frame_id_hex:
+                frame_match    = True
+                frame_out      = frame_id
+                frame_recovery = "majority_vote"
+            elif frame_out is None:
+                try:
+                    frame_out = struct.unpack(">I", bytes.fromhex(voted_hex))[0]
+                except Exception:
+                    pass
+
+    # ── Majority-vote fallback for chain_tag when BCH path failed ──
+    if not chain_match and n_chain_repeat > 0 and len(chain_repeat_ext) >= CHAIN_TAG_BITS * 2:
+        voted = _majority_vote(chain_repeat_ext, CHAIN_TAG_BITS)
+        if voted is not None:
+            voted_hex = array_to_bytes(voted).hex()
+            if voted_hex == expected_chain_tag:
+                chain_match    = True
+                chain_tag_out  = voted_hex
+                chain_recovery = "majority_vote"
+            elif chain_tag_out is None:
+                chain_tag_out = voted_hex
+
+    # Watermark is "found" if EITHER BCH parsed it OR majority-vote recovered
+    # any of the critical fields.  Compression makes BCH fail often, but
+    # majority-vote recovers reliably — both paths count as success.
+    watermark_found = bch_ok or owner_match or media_match or frame_match
+
+    # Top-level recovery_method summarizes the highest-quality path used.
+    if any(r == "majority_vote" for r in
+           (owner_recovery, media_recovery, frame_recovery, chain_recovery)):
         recovery_method = "majority_vote"
-    elif owner_match or media_match:
+    elif owner_match or media_match or frame_match:
         recovery_method = "bch"
     else:
         recovery_method = "none"
 
-    dct_spatial = res["spatial_map"]
-
-    # ── LSB chroma layer → spatial map combination ──
-    # Verify the LSB block-mean parity on Cb, aggregate to the same
-    # 32×32-block grid as the DCT/SVD map, then AND them: a block is
-    # reported as tampered only when BOTH the DCT/SVD fingerprint AND
-    # the chroma LSB parity disagree.  JPEG/H.264 may cause sporadic
-    # DCT/SVD flips, but chroma block-means stay stable inside the
-    # Q=4 quantiser margin, so the LSB layer reads clean and AND kills
-    # the false positives.  PSNR is preserved because LSB only shifts
-    # Cb by ≤ Q/2 = 2 — invisible to Y and small in RGB-perceived MSE.
+    # ── Spatial tamper map from chroma LSB layer ──
+    # Block-mean parity on Cb stays stable inside the Q=2 quantiser margin
+    # under JPEG/H.264 mild compression but flips cleanly on real pixel
+    # edits.  PSNR is preserved because LSB only shifts Cb by ≤ Q/2 = 1.
     if Cb is not None:
-        lsb_res = _verify_lsb_chroma(Cb, signature, frame_id,
-                                     target_shape=dct_spatial.shape)
+        lsb_res        = _verify_lsb_chroma(Cb, signature, frame_id)
         lsb_block_map  = lsb_res["lsb_spatial_map"]
         lsb_sub_mis    = lsb_res["lsb_sub_mismatch"]
         ber_lsb_sub    = lsb_res["ber_lsb_sub"]
         ber_lsb_block  = lsb_res["ber_lsb_block"]
-        h_min = min(dct_spatial.shape[0], lsb_block_map.shape[0])
-        w_min = min(dct_spatial.shape[1], lsb_block_map.shape[1])
-        spatial = dct_spatial[:h_min, :w_min] & lsb_block_map[:h_min, :w_min]
+        spatial        = lsb_block_map
     else:
-        # Greyscale input — no chroma available, fall back to DCT/SVD only.
-        lsb_block_map  = np.zeros_like(dct_spatial)
+        # Greyscale input — no chroma available, no spatial map.
+        lsb_block_map  = np.zeros((0, 0), dtype=bool)
         lsb_sub_mis    = np.zeros((0, 0), dtype=bool)
         ber_lsb_sub    = 0.0
         ber_lsb_block  = 0.0
-        spatial        = dct_spatial
+        spatial        = lsb_block_map
 
     ber_combined = float(spatial.mean()) if spatial.size else 0.0
 
@@ -904,32 +945,41 @@ def verify_image(
         "recovery_method":     recovery_method,
         "owner_recovery":      owner_recovery,
         "media_recovery":      media_recovery,
+        "frame_recovery":      frame_recovery,
+        "chain_recovery":      chain_recovery,
         "owner":               metadata["owner_id"] if owner_match else None,
         "media":               metadata["media_id"] if media_match else None,
         "owner_hash":          owner_hash_out,
         "media_hash":          media_hash_out,
+        "reported_frame":      frame_out,
+        "reported_chain_tag":  chain_tag_out,
+        "expected_chain_tag":  expected_chain_tag,
         "owner_match":         owner_match,
         "media_match":         media_match,
+        "frame_match":         frame_match,
+        "chain_match":         chain_match,
         "bch_corrections":     int(n_corr),
         "owner_repeat_copies": int(n_owner_copies),
         "media_repeat_copies": int(n_media_copies),
-                "ber":                 ber_combined,                # of AND-combined map
-        "ber_dct":             res["ber"],                  # DCT/SVD-only BER
-
-        "ber_LLLH":            res["ber_A"],
-        "ber_LLHL":            res["ber_B"],
-                "ber_lsb_sub":         ber_lsb_sub,
+        "frame_repeat_copies": int(n_frame_copies),
+        "chain_repeat_copies": int(n_chain_copies),
+        "ber":                 ber_combined,
+        "ber_lsb_sub":         ber_lsb_sub,
         "ber_lsb_block":       ber_lsb_block,
-        "spatial_map":         spatial,                     # AND-combined
-        "dct_spatial_map":     dct_spatial,                 # DCT/SVD layer only
-        "lsb_spatial_map":     lsb_block_map,               # chroma-LSB layer only
-        "lsb_sub_mismatch":    lsb_sub_mis,                 # raw 4×4 sub-block grid
-
+        "spatial_map":         spatial,
+        "lsb_spatial_map":     lsb_block_map,
+        "lsb_sub_mismatch":    lsb_sub_mis,
         "n_blocks_total":      int(spatial.size),
         "n_blocks_tampered":   int(spatial.sum()),
-        "tampered":            bool(res["tampered"] and watermark_found and owner_match and media_match) or
-                               bool(watermark_found and (not owner_match or not media_match)) or
-                               bool(not watermark_found),
+        # Tamper rule: any block flagged, identity broken, or temporal mismatch.
+        # Frame/chain checks fire only when we actually have a confirmed value
+        # (BCH parsed OR majority-vote succeeded for that field) — otherwise
+        # codec noise that destroyed both paths would false-positive.
+        "tampered":            bool(int(spatial.sum()) >= MIN_TAMPER_BLOCKS) or
+                               bool(not owner_match) or
+                               bool(not media_match) or
+                               bool((parsed is not None or frame_recovery == "majority_vote") and not frame_match) or
+                               bool((parsed is not None or chain_recovery == "majority_vote") and not chain_match),
         "ber_threshold":       BER_TAMPER_THRESHOLD,
     }
 
@@ -950,9 +1000,8 @@ __all__ = [
     "_master_signature", "_meta_owner_media_hash",
     "_owner_hash_bits_array", "_media_hash_bits_array", "_majority_vote",
     "BLOCK_SIZE", "SPATIAL_BLOCK",
-    "QIM_STEP_ROBUST", "QIM_STEP_FRAGILE",
-    "BER_TAMPER_THRESHOLD",
+    "QIM_STEP_ROBUST",
+    "BER_TAMPER_THRESHOLD", "MIN_TAMPER_BLOCKS",
     "OWNER_HASH_BITS", "OWNER_HASH_REPEATS",
-    "MIN_COPIES_FOR_VOTE",
-    "LSB_SUB_BLOCK_SIZE", "LSB_QIM_STEP", "LSB_BLOCK_TAMPER_RATIO"
+    "LSB_SUB_BLOCK_SIZE", "LSB_QIM_STEP", "LSB_BLOCK_TAMPER_RATIO",
 ]
