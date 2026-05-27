@@ -24,16 +24,29 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, EmailStr
+
+from auth import get_current_user
 
 ENGINE_DIR = (Path(__file__).resolve().parent / "engine").resolve()
 if not ENGINE_DIR.exists():
     raise RuntimeError(f"Cannot find watermark engine at {ENGINE_DIR}")
 sys.path.insert(0, str(ENGINE_DIR))
 
-from watermark_engine import embed_image, verify_image, SPATIAL_BLOCK
+from watermark_engine import (
+    embed_image, verify_image, SPATIAL_BLOCK,
+    _verify_channel, _parse_meta_payload,
+    bch_decode_bits, array_to_bytes,
+    to_float_ycbcr, META_PAYLOAD_BYTES,
+    _BCH_N, _BCH_K,
+    _majority_vote, _decode_id_fixed,
+    OWNER_ID_BITS, MEDIA_ID_BITS, FRAME_ID_BITS, CHAIN_TAG_BITS,
+    OWNER_ID_BYTES, MEDIA_ID_BYTES,
+    OWNER_REPEATS, MEDIA_REPEATS, FRAME_REPEATS, CHAIN_REPEATS,
+)
 from video_watermark import embed_video, verify_video
 
 from db import supabase
@@ -137,16 +150,85 @@ def root():
     return {
         "service":    "watermark-api",
         "engine_dir": str(ENGINE_DIR),
-        "endpoints":  ["/encode", "/verify", "/files/{name}"],
+        "endpoints":  [
+            "/encode", "/verify", "/lookup", "/files/{name}",
+            "/auth/register", "/auth/login", "/auth/me",
+            "/me/media", "/me/media/{id}/metadata",
+        ],
     }
 
+
+# ──────────────────────────────────────────────────────────────
+# Auth (thin wrapper around Supabase Auth)
+# ──────────────────────────────────────────────────────────────
+
+class AuthBody(BaseModel):
+    email:    EmailStr
+    password: str
+
+
+@app.post("/auth/register")
+def auth_register(body: AuthBody):
+    try:
+        res = supabase.auth.sign_up({"email": body.email, "password": body.password})
+    except Exception as e:
+        raise HTTPException(400, f"Registration failed: {e}")
+
+    user = getattr(res, "user", None)
+    if not user:
+        raise HTTPException(400, "Could not create user")
+
+    session = getattr(res, "session", None)
+    # When email-confirmation is on in Supabase, `session` is None until the
+    # user clicks the confirmation link. We surface that to the frontend so
+    # it can show a "check your inbox" screen.
+    return {
+        "user":               {"id": user.id, "email": user.email},
+        "access_token":       session.access_token if session else None,
+        "needs_confirmation": session is None,
+    }
+
+
+@app.post("/auth/login")
+def auth_login(body: AuthBody):
+    try:
+        res = supabase.auth.sign_in_with_password(
+            {"email": body.email, "password": body.password}
+        )
+    except Exception as e:
+        raise HTTPException(401, f"Login failed: {e}")
+
+    session = getattr(res, "session", None)
+    user    = getattr(res, "user", None)
+    if not session or not user:
+        raise HTTPException(401, "Invalid credentials")
+
+    return {
+        "user":         {"id": user.id, "email": user.email},
+        "access_token": session.access_token,
+    }
+
+
+@app.get("/auth/me")
+def auth_me(user: dict = Depends(get_current_user)):
+    return {"id": user["id"], "email": user["email"]}
+
+
+# ──────────────────────────────────────────────────────────────
+# Encode / verify / lookup
+# ──────────────────────────────────────────────────────────────
 
 @app.post("/encode")
 async def encode(
     file:     UploadFile = File(...),
-    owner:    str        = Form(...),
     media_id: str        = Form(...),
+    user:     dict       = Depends(get_current_user),
 ):
+    # Owner is derived from the authenticated user — no longer free-text.
+    # The watermark engine truncates to OWNER_ID_BYTES (8), but the DB
+    # keeps the full email so /lookup still works after compression.
+    owner = user["email"]
+
     kind    = _detect_kind(file.filename)
     file_id = uuid.uuid4().hex[:12]
     in_ext  = os.path.splitext(file.filename)[1].lower()
@@ -169,8 +251,10 @@ async def encode(
     supabase.table("watermarks").insert({
         "id":       file_id,
         "owner":    owner,
+        "media":    media_id,
         "kind":     kind,
         "metadata": meta_jsonable,
+        "user_id":  user["id"],
     }).execute()
 
     return {
@@ -183,12 +267,180 @@ async def encode(
     }
 
 
+# ──────────────────────────────────────────────────────────────
+# Dashboard: a user's own encoded media
+# ──────────────────────────────────────────────────────────────
+
+@app.get("/me/media")
+def list_my_media(user: dict = Depends(get_current_user)):
+    res = (
+        supabase.table("watermarks")
+        .select("*")
+        .eq("user_id", user["id"])
+        .order("created_at", desc=True)
+        .execute()
+    )
+    return {"items": res.data or []}
+
+
+@app.get("/me/media/{file_id}/metadata")
+def get_my_metadata(file_id: str, user: dict = Depends(get_current_user)):
+    res = (
+        supabase.table("watermarks")
+        .select("metadata")
+        .eq("id", file_id)
+        .eq("user_id", user["id"])
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(404, "Not found or not yours")
+    return res.data[0]["metadata"]
+
+
 @app.get("/metadata/{file_id}")
 def get_metadata(file_id: str):
     res = supabase.table("watermarks").select("metadata").eq("id", file_id).execute()
     if not res.data:
         raise HTTPException(404, "Metadata not found")
     return res.data[0]["metadata"]
+
+
+def _blind_extract_ids(img_array: np.ndarray) -> dict | None:
+    """Extract owner_id and media_id from a watermarked image without metadata.
+
+    Tries BCH decode first (works on lossless files).  When compression
+    corrupts BCH, falls back to majority-vote on the repetition copies —
+    the same recovery path that verify_image uses.
+    """
+    if img_array.ndim < 3 or img_array.shape[2] < 3:
+        return None
+
+    Y, _, _ = to_float_ycbcr(img_array[:, :, :3])
+
+    meta_raw_bits = META_PAYLOAD_BYTES * 8                          # 192
+    meta_padded   = ((_BCH_K - meta_raw_bits % _BCH_K) % _BCH_K) + meta_raw_bits
+    n_meta_coded  = (meta_padded // _BCH_K) * _BCH_N               # 420
+
+    # Compute how many extra repetition bits the subbands can hold.
+    H, W = Y.shape
+    h2, w2 = H // 4, W // 4
+    blocks_per_sub = (h2 // 8) * (w2 // 8)
+    total_capacity = blocks_per_sub * 3                             # LLLL+LLLH+LLHL
+    max_extras = (FRAME_REPEATS * FRAME_ID_BITS +
+                  OWNER_REPEATS * OWNER_ID_BITS +
+                  MEDIA_REPEATS * MEDIA_ID_BITS +
+                  CHAIN_REPEATS * CHAIN_TAG_BITS)
+    n_extra = min(max(0, total_capacity - n_meta_coded), max_extras)
+
+    res = _verify_channel(Y, n_meta_coded, b"\x00" * 32, 0,
+                          n_extra_llll_bits=n_extra)
+
+    # ── Try 1: BCH decode ──
+    decoded, _ = bch_decode_bits(res["meta_bits_coded"])
+    meta_bytes = array_to_bytes(decoded[:meta_raw_bits])
+    parsed = _parse_meta_payload(meta_bytes)
+    if parsed:
+        return parsed
+
+    # ── Try 2: majority-vote fallback on repetition copies ──
+    # Layout matches embed order: frame(5x) → owner(3x) → media(3x) → chain(3x)
+    extra = res["extra_llll_bits"]
+    p = 0
+    p += min(FRAME_REPEATS * FRAME_ID_BITS, len(extra))            # skip frame_id
+
+    n_owner = min(OWNER_REPEATS * OWNER_ID_BITS, max(0, len(extra) - p))
+    owner_section = extra[p:p + n_owner]
+    p += n_owner
+
+    n_media = min(MEDIA_REPEATS * MEDIA_ID_BITS, max(0, len(extra) - p))
+    media_section = extra[p:p + n_media]
+
+    owner_voted = (_majority_vote(owner_section, OWNER_ID_BITS)
+                   if len(owner_section) >= OWNER_ID_BITS * 2 else None)
+    media_voted = (_majority_vote(media_section, MEDIA_ID_BITS)
+                   if len(media_section) >= MEDIA_ID_BITS * 2 else None)
+
+    if owner_voted is None and media_voted is None:
+        return None
+
+    owner_str = (_decode_id_fixed(array_to_bytes(owner_voted)[:OWNER_ID_BYTES])
+                 if owner_voted is not None else "")
+    media_str = (_decode_id_fixed(array_to_bytes(media_voted)[:MEDIA_ID_BYTES])
+                 if media_voted is not None else "")
+
+    if not owner_str and not media_str:
+        return None
+
+    return {"owner_id": owner_str, "media_id": media_str}
+
+
+@app.post("/lookup")
+async def lookup(file: UploadFile = File(...)):
+    """Blind-extract owner + media from the watermark, then find the
+    matching record in the database."""
+    kind   = _detect_kind(file.filename)
+    data   = await file.read()
+
+    import io
+
+    parsed = None
+    if kind == "image":
+        img = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+        parsed = _blind_extract_ids(img)
+    else:
+        import cv2
+        file_id_tmp = uuid.uuid4().hex[:12]
+        in_ext = os.path.splitext(file.filename)[1].lower()
+        tmp_path = UPLOAD_DIR / f"{file_id_tmp}_lookup{in_ext}"
+        tmp_path.write_bytes(data)
+        try:
+            cap = cv2.VideoCapture(str(tmp_path), cv2.CAP_FFMPEG)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(str(tmp_path))
+            for _ in range(20):
+                ret, frame = cap.read()
+                if not ret:
+                    break
+                rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                parsed = _blind_extract_ids(rgb)
+                if parsed:
+                    break
+            cap.release()
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    if not parsed:
+        raise HTTPException(404, "Could not extract watermark from this file")
+
+    owner_id = parsed["owner_id"]
+    media_id = parsed["media_id"]
+
+    # Watermark stores only the first 8 bytes of owner/media, but the
+    # database keeps the full original string.  Use case-insensitive prefix
+    # matching so "alice@st" (extracted) matches "alice@studio.com" (stored).
+    res = (
+        supabase.table("watermarks")
+        .select("*")
+        .ilike("owner", f"{owner_id}%")
+        .ilike("media", f"{media_id}%")
+        .execute()
+    )
+
+    if not res.data:
+        raise HTTPException(
+            404,
+            f"No database record for owner={owner_id!r} media={media_id!r}. "
+            f"Extracted from watermark — check these match your encode inputs."
+        )
+
+    record = res.data[0]
+    return {
+        "id":       record["id"],
+        "owner":    record["owner"],
+        "media":    record["media"],
+        "kind":     record["kind"],
+        "metadata": record["metadata"],
+    }
 
 
 @app.post("/verify")

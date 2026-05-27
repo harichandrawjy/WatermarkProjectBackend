@@ -3,17 +3,23 @@ Semi-Fragile Watermarking Engine
 ==================================
 Pipeline:
 
-  Embed:  Y  → 2-level LWT → LLLL → DCT(8x8) → SVD → QIM on S[0] → IDWT.
+  Embed:  Y  → 2-level LWT → {LLLL, LLLH, LLHL} → DCT(8x8) → SVD → QIM on S[0] → IDWT.
           Cb → 16×16 block-mean LSB parity (orthogonal fragile layer).
 
-  Verify: Y  → 2-level LWT → LLLL → DCT(8x8) → SVD → extract bits →
-                BCH-decode → owner/media/frame_id + majority-vote fallback.
+  Verify: Y  → 2-level LWT → {LLLL, LLLH, LLHL} → DCT(8x8) → SVD → extract bits →
+                BCH-decode → owner_id/media_id/frame_id (raw) + majority-vote fallback.
           Cb → block-mean LSB parity → spatial tamper map → decision.
 
-Subband layout:
-  LLLL  ← media meta (BCH-protected)              robust   (QIM_STEP_ROBUST)
-  LLLH  ← (unused — passed through)
-  LLHL  ← (unused — passed through)
+Subband layout (all level-2 LL-family subbands carry payload):
+  LLLL  ← BCH-coded meta + frame_id repeats   (most robust — QIM_STEP_ROBUST)
+  LLLH  ← spillover for repeats              (used when LLLL is full)
+  LLHL  ← spillover for repeats              (used when LLLH is full)
+
+The owner_id and media_id are embedded as RAW 8-byte UTF-8 (null-padded,
+truncated if longer) rather than hashes — so verification can RESTORE
+the actual strings under compression/tamper, not just match a digest.
+Frame_id gets 5x repetition in LLLL (strongest subband) for very strong
+temporal detection.
 
 Spatial tamper localisation is carried entirely by the chroma LSB layer.
 Temporal integrity (frame deletion / reorder) is handled by the
@@ -66,14 +72,37 @@ BER_TAMPER_THRESHOLD = 0.15  # Informational — kept for metadata back-compat.
 # unchanged — every flagged block still surfaces in the heatmap.
 MIN_TAMPER_BLOCKS = 6
 
-# Raw repeated owner_hash copies embedded in LLLL alongside the BCH-coded
-# meta payload.  Used as a majority-vote fallback when BCH decoding fails
-# (which happens when ≥2 bits flip in the same 7-bit codeword).  Each copy
-# is the truncated SHA-256 owner_hash = 4 bytes = 32 bits.
-OWNER_HASH_BITS    = 32
-OWNER_HASH_REPEATS = 3   # need ≥3 for unambiguous majority vote
+# Raw owner_id / media_id are embedded directly (not as hashes) so that
+# verification can RESTORE the actual identifier strings under
+# compression/tamper, not just compare a fingerprint.  Both are encoded
+# as fixed-length UTF-8 (null-padded shorter IDs, truncated longer ones).
+# 8 bytes is the sweet spot: long enough for typical IDs ("alice42",
+# "vid_001a", etc.), short enough that 3 majority-vote copies fit in
+# the LLLL-family capacity of a 512x512 image.
+OWNER_ID_BYTES     = 8
+MEDIA_ID_BYTES     = 8
+OWNER_ID_BITS      = OWNER_ID_BYTES * 8   # 64
+MEDIA_ID_BITS      = MEDIA_ID_BYTES * 8   # 64
 FRAME_ID_BITS      = 32  # raw frame_id repeated for majority-vote temporal recovery
 CHAIN_TAG_BITS     = 16  # raw chain_tag repeated for majority-vote chain recovery
+
+# Repetition counts — each field's raw bits are tiled this many times and
+# embedded after the BCH-coded meta.  Decoder majority-votes per field.
+# Priority order (head of stream gets the most LLLL space — lower-priority
+# fields get truncated first when capacity runs out):
+#   frame_id (5x) — temporal integrity is critical for video, and frame_id
+#                   sits in LLLL (most robust subband) per user spec
+#   owner_id (3x) — provenance
+#   media_id (3x) — provenance
+#   chain_tag(3x) — replay/reorder detection
+FRAME_REPEATS      = 5
+OWNER_REPEATS      = 3
+MEDIA_REPEATS      = 3
+CHAIN_REPEATS      = 3
+
+# Back-compat alias — older callers read these names.
+OWNER_HASH_BITS    = OWNER_ID_BITS
+OWNER_HASH_REPEATS = OWNER_REPEATS
 
 
 # ──────────────────────────────────────────────────────────────
@@ -164,14 +193,38 @@ def array_to_bytes(arr: np.ndarray) -> bytes:
     return np.packbits(bits).tobytes()
 
 
-def _owner_hash_bits_array(owner_id: str) -> np.ndarray:
-    """32-bit array form of the truncated SHA-256 owner_hash."""
-    return bits_to_array(hashlib.sha256(owner_id.encode()).digest()[:4])
+def _encode_id_fixed(s: str, n_bytes: int) -> bytes:
+    """UTF-8 encode `s` into exactly `n_bytes`: null-pad short, truncate long.
+
+    Truncation is byte-wise — a multi-byte UTF-8 char that straddles the
+    cutoff is dropped from the suffix.  Null-padding lets the decoder
+    strip trailing zeros to recover the original (when it fit)."""
+    raw = s.encode('utf-8')[:n_bytes]
+    return raw + b'\x00' * (n_bytes - len(raw))
 
 
-def _media_hash_bits_array(media_id: str) -> np.ndarray:
-    """32-bit array form of the truncated SHA-256 media_hash."""
-    return bits_to_array(hashlib.sha256(media_id.encode()).digest()[:4])
+def _decode_id_fixed(b: bytes) -> str:
+    """Inverse of `_encode_id_fixed`: strip null padding and UTF-8 decode.
+
+    `errors='replace'` keeps decoding robust when a truncated multi-byte
+    sequence remains at the tail (recovery still surfaces something
+    rather than throwing)."""
+    return b.rstrip(b'\x00').decode('utf-8', errors='replace')
+
+
+def _owner_id_bits_array(owner_id: str) -> np.ndarray:
+    """Bit array of the raw fixed-length owner_id (8 bytes UTF-8)."""
+    return bits_to_array(_encode_id_fixed(owner_id, OWNER_ID_BYTES))
+
+
+def _media_id_bits_array(media_id: str) -> np.ndarray:
+    """Bit array of the raw fixed-length media_id (8 bytes UTF-8)."""
+    return bits_to_array(_encode_id_fixed(media_id, MEDIA_ID_BYTES))
+
+
+# Back-compat aliases — older callers reference the hash names.
+_owner_hash_bits_array = _owner_id_bits_array
+_media_hash_bits_array = _media_id_bits_array
 
 
 def _frame_id_bits_array(frame_id: int) -> np.ndarray:
@@ -507,28 +560,52 @@ def _embed_into_channel(
     frame_id: int,
     extra_llll_bits: Optional[np.ndarray] = None,
 ) -> Tuple[np.ndarray, Dict]:
+    """Embed BCH-coded meta + raw repetition copies across the level-2
+    LL-family subbands (LLLL → LLLH → LLHL, in priority order).
+
+    LLLL is the most compression-robust subband, so we fill it first.
+    LLLH and LLHL are used as overflow when the payload exceeds LLLL's
+    capacity (which happens for any reasonably-sized payload at small
+    image dimensions like 512x512).  HH-family subbands stay untouched.
+    """
     Y = Y.astype(np.float64)
 
     # Level-1 then level-2 LWT (Haar lifting ≡ Haar DWT)
     LL,   (LH1, HL1, HH1) = pywt.dwt2(Y,  WAVELET)
     LLLL, (LLLH, LLHL, LLHH) = pywt.dwt2(LL, WAVELET)
 
-    # LLLL stream = [BCH-coded meta] + [raw owner/media hash repetitions].
-    # Repetitions are extracted whole-pattern at decode and majority-voted
-    # to recover owner_hash and media_hash even when BCH miscorrects.
+    # Build the combined bit stream: BCH-coded meta first, then raw
+    # repetition copies (majority-voted at decode).  The meta payload
+    # already contains the IDs once via BCH; the repetition copies are
+    # an independent recovery channel for when BCH miscorrects.
     if extra_llll_bits is None or len(extra_llll_bits) == 0:
-        llll_stream = meta_bits
+        full_stream = np.asarray(meta_bits, dtype=np.uint8)
     else:
-        llll_stream = np.concatenate([
+        full_stream = np.concatenate([
             np.asarray(meta_bits, dtype=np.uint8),
             np.asarray(extra_llll_bits, dtype=np.uint8),
         ])
 
-    # ── Embed: LLLL only.  LLLH/LLHL pass through untouched. ──
-    LLLL, n_llll = _embed_bits_dct_svd(LLLL, llll_stream, QIM_STEP_ROBUST)
+    # ── Embed across LLLL → LLLH → LLHL in priority order. ──
+    # Each subband-embed returns the number of bits it consumed; we
+    # cascade the remainder into the next subband.
+    cursor = 0
+    LLLL, n_in_llll = _embed_bits_dct_svd(LLLL, full_stream[cursor:], QIM_STEP_ROBUST)
+    cursor += n_in_llll
 
-    n_meta  = min(n_llll, len(meta_bits))
-    n_extra = max(0, n_llll - len(meta_bits))
+    n_in_llh = 0
+    if cursor < len(full_stream):
+        LLLH, n_in_llh = _embed_bits_dct_svd(LLLH, full_stream[cursor:], QIM_STEP_ROBUST)
+        cursor += n_in_llh
+
+    n_in_lhl = 0
+    if cursor < len(full_stream):
+        LLHL, n_in_lhl = _embed_bits_dct_svd(LLHL, full_stream[cursor:], QIM_STEP_ROBUST)
+        cursor += n_in_lhl
+
+    n_embedded = cursor
+    n_meta     = min(n_embedded, len(meta_bits))
+    n_extra    = max(0, n_embedded - len(meta_bits))
 
     # Inverse 2-level
     LL_wm  = pywt.idwt2((LLLL, (LLLH, LLHL, LLHH)), WAVELET)[:LL.shape[0], :LL.shape[1]]
@@ -537,6 +614,9 @@ def _embed_into_channel(
     info = {
         "n_meta_bits":         int(n_meta),
         "n_extra_llll_bits":   int(n_extra),
+        "n_bits_llll":         int(n_in_llll),
+        "n_bits_lllh":         int(n_in_llh),
+        "n_bits_llhl":         int(n_in_lhl),
     }
     return Y_wm, info
 
@@ -552,17 +632,31 @@ def _verify_channel(
     frame_id: int,
     n_extra_llll_bits: int = 0,
 ) -> Dict:
+    """Extract the bit stream from the level-2 LL-family subbands in the
+    same priority order used at embed: LLLL → LLLH → LLHL.  The cascade
+    must match `_embed_into_channel` exactly or the per-block alignment
+    drifts and every downstream bit becomes garbage."""
     Yf = Y.astype(np.float64)
     LL, _ = pywt.dwt2(Yf, WAVELET)
-    LLLL, _ = pywt.dwt2(LL, WAVELET)
+    LLLL, (LLLH, LLHL, _LLHH) = pywt.dwt2(LL, WAVELET)
 
-    # Single LLLL extraction covering BCH meta + raw owner/media repetitions
-    # (kept in one call so the block walk order matches embed exactly).
-    n_extra      = max(0, n_extra_llll_bits)
-    n_total_llll = n_meta_bits_coded + n_extra
-    llll_ext, _  = _extract_bits_dct_svd_with_mask(LLLL, n_total_llll, QIM_STEP_ROBUST)
-    meta_bits    = llll_ext[:n_meta_bits_coded]
-    extra_ext    = llll_ext[n_meta_bits_coded:n_meta_bits_coded + n_extra]
+    n_extra     = max(0, n_extra_llll_bits)
+    n_total     = n_meta_bits_coded + n_extra
+
+    # Pull from LLLL first, spill into LLLH then LLHL — same order as embed.
+    parts: List[np.ndarray] = []
+    remaining = n_total
+
+    for sub in (LLLL, LLLH, LLHL):
+        if remaining <= 0:
+            break
+        bits, _ = _extract_bits_dct_svd_with_mask(sub, remaining, QIM_STEP_ROBUST)
+        parts.append(bits)
+        remaining -= len(bits)
+
+    full_ext  = np.concatenate(parts) if parts else np.zeros(0, dtype=np.uint8)
+    meta_bits = full_ext[:n_meta_bits_coded]
+    extra_ext = full_ext[n_meta_bits_coded:n_meta_bits_coded + n_extra]
 
     return {
         "meta_bits_coded":  meta_bits,
@@ -615,56 +709,74 @@ def _expected_chain_state(media_hash_bytes: bytes, iteration_index: int,
     return chain
 
 
-# Meta payload layout (16 bytes, BCH(7,4)-protected as 224 bits):
-#   owner_hash(4) || media_hash(4) || frame_id(4) || chain_tag(2) || integrity_tag(2)
-META_PAYLOAD_BYTES = 16
-_META_BODY_BYTES   = 14    # everything except the trailing integrity_tag
+# Meta payload layout (24 bytes, BCH(15,7)-protected):
+#   owner_id(8) || media_id(8) || frame_id(4) || chain_tag(2) || integrity_tag(2)
+# owner_id and media_id are raw UTF-8 (null-padded), not hashes — this is
+# what lets verify RESTORE the actual identifier strings rather than just
+# matching a fingerprint.
+META_PAYLOAD_BYTES = OWNER_ID_BYTES + MEDIA_ID_BYTES + 4 + 2 + 2   # = 24
+_META_BODY_BYTES   = META_PAYLOAD_BYTES - 2                        # = 22 (excl. integrity)
 
 
 def _build_meta_payload(owner_id: str, media_id: str, frame_id: int,
                         chain_tag: bytes = b"\x00\x00") -> bytes:
-    """Compact 16-byte LLLL header.
+    """Compact 24-byte LLLL header carrying the raw IDs (not hashes).
 
-    The full owner/media strings live in the JSON sidecar; here we only embed
-    truncated SHA-256 hashes of them (one-way commitments), the frame index,
-    a 2-byte chain_tag for temporal integrity, and a 2-byte integrity tag.
-    At 512x512 the LLLL subband holds ~256 bits after BCH(7,4), which is
-    enough room for the 224 BCH-coded bits of this payload.
+    Layout:
+      owner_id   : 8 bytes  UTF-8, null-padded/truncated
+      media_id   : 8 bytes  UTF-8, null-padded/truncated
+      frame_id   : 4 bytes  big-endian uint32
+      chain_tag  : 2 bytes  (caller-supplied — first 2B of SHA-256 chain state)
+      integrity  : 2 bytes  SHA-256(body)[:2]  — sanity check on BCH decode
     """
     if len(chain_tag) != 2:
         raise ValueError(f"chain_tag must be 2 bytes, got {len(chain_tag)}")
-    owner_h = hashlib.sha256(owner_id.encode()).digest()[:4]
-    media_h = hashlib.sha256(media_id.encode()).digest()[:4]
+    owner_b = _encode_id_fixed(owner_id, OWNER_ID_BYTES)
+    media_b = _encode_id_fixed(media_id, MEDIA_ID_BYTES)
     frame_b = struct.pack(">I", frame_id)
-    body    = owner_h + media_h + frame_b + chain_tag        # 14 bytes
+    body    = owner_b + media_b + frame_b + chain_tag                # 22 bytes
     tag     = hashlib.sha256(body).digest()[:2]
-    return body + tag                                         # 16 bytes = 128 bits
+    return body + tag                                                 # 24 bytes
 
 
 def _parse_meta_payload(meta_bytes: bytes) -> Optional[Dict]:
+    """Inverse of `_build_meta_payload`. Returns None if the integrity tag
+    doesn't validate (BCH miscorrected / payload is junk)."""
     try:
         if len(meta_bytes) < META_PAYLOAD_BYTES:
             return None
-        body, tag = meta_bytes[:_META_BODY_BYTES], meta_bytes[_META_BODY_BYTES:META_PAYLOAD_BYTES]
+        body = meta_bytes[:_META_BODY_BYTES]
+        tag  = meta_bytes[_META_BODY_BYTES:META_PAYLOAD_BYTES]
         if hashlib.sha256(body).digest()[:2] != tag:
             return None
+        p = 0
+        owner_b = body[p:p + OWNER_ID_BYTES]; p += OWNER_ID_BYTES
+        media_b = body[p:p + MEDIA_ID_BYTES]; p += MEDIA_ID_BYTES
+        frame_b = body[p:p + 4];              p += 4
+        chain_b = body[p:p + 2]
         return {
-            "owner_hash": body[:4].hex(),
-            "media_hash": body[4:8].hex(),
-            "frame":      struct.unpack(">I", body[8:12])[0],
-            "chain_tag":  body[12:14].hex(),
+            "owner_id":  _decode_id_fixed(owner_b),
+            "media_id":  _decode_id_fixed(media_b),
+            "frame":     struct.unpack(">I", frame_b)[0],
+            "chain_tag": chain_b.hex(),
         }
     except Exception:
         return None
 
 
-def _meta_owner_media_hash(owner_id: str, media_id: str) -> Tuple[str, str]:
-    """Truncated owner/media hashes used to validate the JSON sidecar matches
-    what was actually embedded in the watermark."""
+def _meta_owner_media_id(owner_id: str, media_id: str) -> Tuple[str, str]:
+    """Decoded round-trip form of owner_id / media_id as they would appear
+    after embed + extract.  Used to compare an extracted ID against what
+    the caller passed in, accounting for null-padding truncation.
+    """
     return (
-        hashlib.sha256(owner_id.encode()).digest()[:4].hex(),
-        hashlib.sha256(media_id.encode()).digest()[:4].hex(),
+        _decode_id_fixed(_encode_id_fixed(owner_id, OWNER_ID_BYTES)),
+        _decode_id_fixed(_encode_id_fixed(media_id, MEDIA_ID_BYTES)),
     )
+
+
+# Back-compat alias — kept so older callers don't break during transition.
+_meta_owner_media_hash = _meta_owner_media_id
 
 
 def _master_signature(owner_id: str, media_id: str, frame_id: int) -> bytes:
@@ -700,6 +812,10 @@ def embed_image(
         raise ValueError("Input must be H×W×3 RGB.")
 
     signature   = _master_signature(owner_id, media_id, frame_id)
+    # Chain still keyed by media_id — kept as a SHA-256 derivation so the
+    # chain_tag's secrecy properties are unchanged.  This is an internal
+    # derivation, not an embedded fingerprint, so it doesn't conflict with
+    # the "no hashes in the watermark" goal.
     media_h_b   = hashlib.sha256(media_id.encode()).digest()[:4]
     chain_state = _frame_chain_hash(media_h_b, _chain_genesis(media_h_b), frame_id)
     chain_tag   = chain_state[:2]
@@ -708,18 +824,18 @@ def embed_image(
     meta_coded  = bch_encode_bits(meta_bits)
 
     # Raw repeated fields for majority-vote fallback when BCH miscorrects.
-    # Priority order (head of stream gets the most LLLL space — lower-priority
-    # fields get truncated first):
-    #   owner_hash   — provenance-critical
-    #   media_hash   — provenance-critical
-    #   frame_id     — temporal integrity
-    #   chain_tag    — temporal integrity (reorder/replay detection)
-    owner_repeated     = np.tile(_owner_hash_bits_array(owner_id),       OWNER_HASH_REPEATS)
-    media_repeated     = np.tile(_media_hash_bits_array(media_id),       OWNER_HASH_REPEATS)
-    frame_id_repeated  = np.tile(_frame_id_bits_array(frame_id),         OWNER_HASH_REPEATS)
-    chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag),       OWNER_HASH_REPEATS)
-    extras             = np.concatenate([owner_repeated, media_repeated,
-                                         frame_id_repeated, chain_tag_repeated])
+    # Priority order (head of stream gets the strongest subband space —
+    # lower-priority fields get truncated first):
+    #   frame_id   (5x) — temporal integrity, lives in LLLL per user spec
+    #   owner_id   (3x) — provenance, raw bytes (recoverable string)
+    #   media_id   (3x) — provenance, raw bytes (recoverable string)
+    #   chain_tag  (3x) — replay/reorder detection
+    frame_id_repeated  = np.tile(_frame_id_bits_array(frame_id),    FRAME_REPEATS)
+    owner_repeated     = np.tile(_owner_id_bits_array(owner_id),    OWNER_REPEATS)
+    media_repeated     = np.tile(_media_id_bits_array(media_id),    MEDIA_REPEATS)
+    chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag),  CHAIN_REPEATS)
+    extras             = np.concatenate([frame_id_repeated, owner_repeated,
+                                         media_repeated,    chain_tag_repeated])
 
     Y, Cb, Cr = to_float_ycbcr(img_array[:,:,:3])
     Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_id, extras)
@@ -728,56 +844,60 @@ def embed_image(
     Cb_wm = _embed_lsb_chroma(Cb, signature, frame_id)
     if info["n_meta_bits"] < len(meta_coded):
         raise ValueError(
-            f"LLLL too small: embedded {info['n_meta_bits']}/{len(meta_coded)} "
+            f"LLLL family too small: embedded {info['n_meta_bits']}/{len(meta_coded)} "
             f"BCH-coded meta bits.  Use a larger image or shorter owner/media IDs."
         )
 
     # Tally how many FULL copies of each fit (partial copies can't vote).
-    # Priority order: owner → media → frame_id → chain_tag.  Each lower-
-    # priority field gets whatever LLLL space remains after the higher ones.
+    # Priority order: frame_id → owner_id → media_id → chain_tag.
     n_extra_emb       = info["n_extra_llll_bits"]
-    n_owner_copies    = min(OWNER_HASH_REPEATS, n_extra_emb // OWNER_HASH_BITS)
-    remaining         = max(0, n_extra_emb - n_owner_copies * OWNER_HASH_BITS)
-    n_media_copies    = min(OWNER_HASH_REPEATS, remaining // OWNER_HASH_BITS)
-    remaining        -= n_media_copies * OWNER_HASH_BITS
-    n_frame_copies    = min(OWNER_HASH_REPEATS, remaining // FRAME_ID_BITS)
-    remaining        -= n_frame_copies * FRAME_ID_BITS
-    n_chain_copies    = min(OWNER_HASH_REPEATS, remaining // CHAIN_TAG_BITS)
+    n_frame_copies    = min(FRAME_REPEATS, n_extra_emb // FRAME_ID_BITS)
+    remaining         = max(0, n_extra_emb - n_frame_copies * FRAME_ID_BITS)
+    n_owner_copies    = min(OWNER_REPEATS, remaining // OWNER_ID_BITS)
+    remaining        -= n_owner_copies * OWNER_ID_BITS
+    n_media_copies    = min(MEDIA_REPEATS, remaining // MEDIA_ID_BITS)
+    remaining        -= n_media_copies * MEDIA_ID_BITS
+    n_chain_copies    = min(CHAIN_REPEATS, remaining // CHAIN_TAG_BITS)
 
-    n_owner_bits  = n_owner_copies * OWNER_HASH_BITS
-    n_media_bits  = n_media_copies * OWNER_HASH_BITS
     n_frame_bits  = n_frame_copies * FRAME_ID_BITS
+    n_owner_bits  = n_owner_copies * OWNER_ID_BITS
+    n_media_bits  = n_media_copies * MEDIA_ID_BITS
     n_chain_bits  = n_chain_copies * CHAIN_TAG_BITS
 
-    if (n_owner_copies < OWNER_HASH_REPEATS or n_media_copies < OWNER_HASH_REPEATS
-            or n_frame_copies < OWNER_HASH_REPEATS or n_chain_copies < OWNER_HASH_REPEATS):
+    if (n_frame_copies < FRAME_REPEATS or n_owner_copies < OWNER_REPEATS
+            or n_media_copies < MEDIA_REPEATS or n_chain_copies < CHAIN_REPEATS):
         print(f"[embed_image] note: fit "
-              f"{n_owner_copies}/{OWNER_HASH_REPEATS} owner + "
-              f"{n_media_copies}/{OWNER_HASH_REPEATS} media + "
-              f"{n_frame_copies}/{OWNER_HASH_REPEATS} frame_id + "
-              f"{n_chain_copies}/{OWNER_HASH_REPEATS} chain_tag majority-vote copies in LLLL.")
+              f"{n_frame_copies}/{FRAME_REPEATS} frame_id + "
+              f"{n_owner_copies}/{OWNER_REPEATS} owner_id + "
+              f"{n_media_copies}/{MEDIA_REPEATS} media_id + "
+              f"{n_chain_copies}/{CHAIN_REPEATS} chain_tag majority-vote copies "
+              f"(used LLLL={info.get('n_bits_llll',0)} LLLH={info.get('n_bits_lllh',0)} "
+              f"LLHL={info.get('n_bits_llhl',0)} bits).")
 
     rgb = from_float_ycbcr(Y_wm, Cb_wm, Cr)
     mse = np.mean((img_array[:,:,:3].astype(np.float64) - rgb.astype(np.float64)) ** 2)
     psnr = float(10.0 * np.log10(255.0 ** 2 / mse)) if mse > 0 else float("inf")
     metadata = {
-        "version":             "v3",
+        "version":             "v4",
         "owner_id":            owner_id,
         "media_id":            media_id,
         "frame_id":            frame_id,
         "meta_bits_raw":       int(len(meta_bits)),
         "meta_bits_coded":     int(len(meta_coded)),
+        "frame_repeat_bits":     int(n_frame_bits),
+        "frame_repeat_copies":   int(n_frame_copies),
         "owner_repeat_bits":     int(n_owner_bits),
         "owner_repeat_copies":   int(n_owner_copies),
         "media_repeat_bits":     int(n_media_bits),
         "media_repeat_copies":   int(n_media_copies),
-        "frame_repeat_bits":     int(n_frame_bits),
-        "frame_repeat_copies":   int(n_frame_copies),
         "chain_repeat_bits":     int(n_chain_bits),
         "chain_repeat_copies":   int(n_chain_copies),
-        "owner_hash_bits":       int(OWNER_HASH_BITS),
+        "owner_id_bits":         int(OWNER_ID_BITS),
+        "media_id_bits":         int(MEDIA_ID_BITS),
         "frame_id_bits":         int(FRAME_ID_BITS),
         "chain_tag_bits":        int(CHAIN_TAG_BITS),
+        # Back-compat alias — older callers read owner_hash_bits.
+        "owner_hash_bits":       int(OWNER_ID_BITS),
         "psnr_db":             psnr,
     }
     return rgb, metadata
@@ -815,10 +935,11 @@ def verify_image(
         n_extra_llll_bits=n_extra_total,
     )
     extra_bits   = res["extra_llll_bits"]
+    # Extra-bit layout MUST match embed order: frame_id → owner → media → chain.
     p = 0
+    frame_repeat_ext = extra_bits[p:p + n_frame_repeat]; p += n_frame_repeat
     owner_repeat_ext = extra_bits[p:p + n_owner_repeat]; p += n_owner_repeat
     media_repeat_ext = extra_bits[p:p + n_media_repeat]; p += n_media_repeat
-    frame_repeat_ext = extra_bits[p:p + n_frame_repeat]; p += n_frame_repeat
     chain_repeat_ext = extra_bits[p:p + n_chain_repeat]
 
     # BCH-decode meta bits
@@ -826,23 +947,26 @@ def verify_image(
     meta_bytes = array_to_bytes(meta_bits_dec[:metadata["meta_bits_raw"]])
     parsed     = _parse_meta_payload(meta_bytes)
 
-    expected_owner_h, expected_media_h = _meta_owner_media_hash(
+    # Compare against the round-trip form of the IDs (i.e., after encode→decode
+    # truncation), so IDs longer than the fixed slot still match cleanly.
+    expected_owner_id, expected_media_id = _meta_owner_media_id(
         metadata["owner_id"], metadata["media_id"])
 
-    # Expected chain_tag for a single-image case: one chain step from genesis.
-    media_h_b           = bytes.fromhex(expected_media_h)
+    # Expected chain_tag for a single-image case: one chain step from genesis,
+    # keyed by the first 4 bytes of SHA-256(media_id) (matches embed_image).
+    media_h_b           = hashlib.sha256(metadata["media_id"].encode()).digest()[:4]
     expected_chain_full = _frame_chain_hash(media_h_b, _chain_genesis(media_h_b), frame_id)
     expected_chain_tag  = expected_chain_full[:2].hex()
 
     expected_frame_id_hex = struct.pack(">I", frame_id).hex()
 
     bch_ok           = parsed is not None
-    owner_match      = bool(parsed and parsed.get("owner_hash") == expected_owner_h)
-    media_match      = bool(parsed and parsed.get("media_hash") == expected_media_h)
-    chain_match      = bool(parsed and parsed.get("chain_tag")  == expected_chain_tag)
-    frame_match      = bool(parsed and parsed.get("frame")      == frame_id)
-    owner_hash_out   = parsed.get("owner_hash") if parsed else None
-    media_hash_out   = parsed.get("media_hash") if parsed else None
+    owner_match      = bool(parsed and parsed.get("owner_id") == expected_owner_id)
+    media_match      = bool(parsed and parsed.get("media_id") == expected_media_id)
+    chain_match      = bool(parsed and parsed.get("chain_tag") == expected_chain_tag)
+    frame_match      = bool(parsed and parsed.get("frame")     == frame_id)
+    owner_id_out     = parsed.get("owner_id") if parsed else None
+    media_id_out     = parsed.get("media_id") if parsed else None
     frame_out        = parsed.get("frame") if parsed else None
     chain_tag_out    = parsed.get("chain_tag") if parsed else None
     owner_recovery   = "bch" if owner_match else ("none" if not bch_ok else "bch_mismatch")
@@ -850,35 +974,9 @@ def verify_image(
     frame_recovery   = "bch" if frame_match else ("none" if not bch_ok else "bch_mismatch")
     chain_recovery   = "bch" if chain_match else ("none" if not bch_ok else "bch_mismatch")
 
-    # ── Majority-vote fallback for owner_hash when BCH path failed ──
-    # Compression often makes BCH fail; majority-vote on the repeated copies
-    # still recovers the owner reliably.  This is the primary robustness path.
-    if not owner_match and n_owner_repeat > 0 and len(owner_repeat_ext) >= OWNER_HASH_BITS * 2:
-        voted = _majority_vote(owner_repeat_ext, OWNER_HASH_BITS)
-        if voted is not None:
-            voted_hex = array_to_bytes(voted).hex()
-            if voted_hex == expected_owner_h:
-                owner_match    = True
-                owner_hash_out = voted_hex
-                owner_recovery = "majority_vote"
-            elif owner_hash_out is None:
-                owner_hash_out = voted_hex
-
-    # ── Majority-vote fallback for media_hash when BCH path failed ──
-    if not media_match and n_media_repeat > 0 and len(media_repeat_ext) >= OWNER_HASH_BITS * 2:
-        voted = _majority_vote(media_repeat_ext, OWNER_HASH_BITS)
-        if voted is not None:
-            voted_hex = array_to_bytes(voted).hex()
-            if voted_hex == expected_media_h:
-                media_match    = True
-                media_hash_out = voted_hex
-                media_recovery = "majority_vote"
-            elif media_hash_out is None:
-                media_hash_out = voted_hex
-
     # ── Majority-vote fallback for frame_id when BCH path failed ──
-    # Temporal integrity is as critical as identity — if BCH miscorrects,
-    # majority-vote on the raw frame_id copies still recovers it.
+    # frame_id leads the repetition stream (lives in LLLL — most robust),
+    # so it's the field most likely to recover under heavy compression.
     if not frame_match and n_frame_repeat > 0 and len(frame_repeat_ext) >= FRAME_ID_BITS * 2:
         voted = _majority_vote(frame_repeat_ext, FRAME_ID_BITS)
         if voted is not None:
@@ -892,6 +990,32 @@ def verify_image(
                     frame_out = struct.unpack(">I", bytes.fromhex(voted_hex))[0]
                 except Exception:
                     pass
+
+    # ── Majority-vote fallback for owner_id when BCH path failed ──
+    # Recovers the RAW UTF-8 owner string (truncated/null-padded), not a hash —
+    # so the actual identifier survives compression/tamper.
+    if not owner_match and n_owner_repeat > 0 and len(owner_repeat_ext) >= OWNER_ID_BITS * 2:
+        voted = _majority_vote(owner_repeat_ext, OWNER_ID_BITS)
+        if voted is not None:
+            voted_str = _decode_id_fixed(array_to_bytes(voted)[:OWNER_ID_BYTES])
+            if voted_str == expected_owner_id:
+                owner_match    = True
+                owner_id_out   = voted_str
+                owner_recovery = "majority_vote"
+            elif owner_id_out is None:
+                owner_id_out = voted_str
+
+    # ── Majority-vote fallback for media_id when BCH path failed ──
+    if not media_match and n_media_repeat > 0 and len(media_repeat_ext) >= MEDIA_ID_BITS * 2:
+        voted = _majority_vote(media_repeat_ext, MEDIA_ID_BITS)
+        if voted is not None:
+            voted_str = _decode_id_fixed(array_to_bytes(voted)[:MEDIA_ID_BYTES])
+            if voted_str == expected_media_id:
+                media_match    = True
+                media_id_out   = voted_str
+                media_recovery = "majority_vote"
+            elif media_id_out is None:
+                media_id_out = voted_str
 
     # ── Majority-vote fallback for chain_tag when BCH path failed ──
     if not chain_match and n_chain_repeat > 0 and len(chain_repeat_ext) >= CHAIN_TAG_BITS * 2:
@@ -949,8 +1073,15 @@ def verify_image(
         "chain_recovery":      chain_recovery,
         "owner":               metadata["owner_id"] if owner_match else None,
         "media":               metadata["media_id"] if media_match else None,
-        "owner_hash":          owner_hash_out,
-        "media_hash":          media_hash_out,
+        # Raw recovered IDs (truncated UTF-8) — present even on mismatch so
+        # the caller can inspect what was actually extracted from the
+        # watermark.  None when no path produced a value.
+        "owner_id_recovered":  owner_id_out,
+        "media_id_recovered":  media_id_out,
+        # Back-compat: callers reading the old hash keys still get a string;
+        # under the new scheme this is the raw recovered identifier, not a digest.
+        "owner_hash":          owner_id_out,
+        "media_hash":          media_id_out,
         "reported_frame":      frame_out,
         "reported_chain_tag":  chain_tag_out,
         "expected_chain_tag":  expected_chain_tag,
@@ -992,16 +1123,26 @@ __all__ = [
     "embed_image", "verify_image",
     "bch_encode_bits", "bch_decode_bits",
     "bits_to_array", "array_to_bytes",
-        "_embed_lsb_chroma", "_verify_lsb_chroma",
+    "_embed_lsb_chroma", "_verify_lsb_chroma",
 
     "to_float_ycbcr", "from_float_ycbcr",
     "_embed_into_channel", "_verify_channel",
     "_build_meta_payload", "_parse_meta_payload",
-    "_master_signature", "_meta_owner_media_hash",
-    "_owner_hash_bits_array", "_media_hash_bits_array", "_majority_vote",
+    "_master_signature",
+    "_meta_owner_media_id", "_meta_owner_media_hash",
+    "_owner_id_bits_array", "_media_id_bits_array",
+    "_owner_hash_bits_array", "_media_hash_bits_array",
+    "_encode_id_fixed", "_decode_id_fixed",
+    "_frame_id_bits_array", "_chain_tag_bits_array",
+    "_majority_vote",
+    "_chain_genesis", "_frame_chain_hash", "_expected_chain_state",
     "BLOCK_SIZE", "SPATIAL_BLOCK",
     "QIM_STEP_ROBUST",
     "BER_TAMPER_THRESHOLD", "MIN_TAMPER_BLOCKS",
+    "OWNER_ID_BYTES", "MEDIA_ID_BYTES",
+    "OWNER_ID_BITS", "MEDIA_ID_BITS",
+    "FRAME_ID_BITS", "CHAIN_TAG_BITS",
+    "OWNER_REPEATS", "MEDIA_REPEATS", "FRAME_REPEATS", "CHAIN_REPEATS",
     "OWNER_HASH_BITS", "OWNER_HASH_REPEATS",
     "LSB_SUB_BLOCK_SIZE", "LSB_QIM_STEP", "LSB_BLOCK_TAMPER_RATIO",
 ]

@@ -34,12 +34,15 @@ from watermark_engine import (
     _embed_lsb_chroma, _verify_lsb_chroma,
 
     _build_meta_payload, _parse_meta_payload,
-    _master_signature, _meta_owner_media_hash,
-    _owner_hash_bits_array, _media_hash_bits_array, _majority_vote,
+    _master_signature, _meta_owner_media_id,
+    _owner_id_bits_array, _media_id_bits_array, _majority_vote,
     _frame_id_bits_array, _chain_tag_bits_array,
+    _encode_id_fixed, _decode_id_fixed,
     _chain_genesis, _frame_chain_hash,
 
-    OWNER_HASH_BITS, OWNER_HASH_REPEATS,
+    OWNER_ID_BYTES, MEDIA_ID_BYTES,
+    OWNER_ID_BITS, MEDIA_ID_BITS,
+    OWNER_REPEATS, MEDIA_REPEATS, FRAME_REPEATS, CHAIN_REPEATS,
     FRAME_ID_BITS, CHAIN_TAG_BITS,
 
     BER_TAMPER_THRESHOLD, MIN_TAMPER_BLOCKS,
@@ -78,7 +81,9 @@ class _FFmpegWriter:
     """
 
     def __init__(self, output_path: str, fps: float, width: int, height: int,
-                 ffmpeg_exe: str, crf: int = 18, preset: str = "medium"):
+                 ffmpeg_exe: str, crf: int = 18, preset: str = "medium",
+                 audio_source_path: Optional[str] = None,
+                 codec: str = "libx264", pix_fmt: str = "yuv444p"):
         self._proc: Optional[subprocess.Popen] = None
         self._opened = False
         self._output_path = output_path
@@ -99,13 +104,25 @@ class _FFmpegWriter:
             "-s", f"{width}x{height}",
             "-r", f"{fps}",
             "-i", "-",
-            "-an",
-            "-c:v", "libx264",
-            "-preset", preset,
-            "-crf", str(crf),
-            "-pix_fmt", "yuv444p",
-            output_path,
         ]
+        if audio_source_path is not None:
+            # Second input: the original file, used only to copy its audio
+            # stream into the output.  `1:a?` makes the audio map optional —
+            # a silent source still encodes cleanly.  `-c:a copy` avoids any
+            # re-encode of the audio (bit-identical, no extra deps).
+            cmd.extend([
+                "-i", audio_source_path,
+                "-map", "0:v:0",
+                "-map", "1:a?",
+                "-c:a", "copy",
+            ])
+        else:
+            cmd.append("-an")
+        vid_opts = ["-c:v", codec]
+        if codec != "ffv1":
+            vid_opts.extend(["-preset", preset, "-crf", str(crf)])
+        vid_opts.extend(["-pix_fmt", pix_fmt, output_path])
+        cmd.extend(vid_opts)
         try:
             self._proc = subprocess.Popen(
                 cmd, stdin=subprocess.PIPE,
@@ -173,28 +190,28 @@ def embed_video(
     total  = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
 
     ext = os.path.splitext(output_path)[1].lower()
+    ffmpeg_exe = _find_ffmpeg()
+    if ffmpeg_exe is None:
+        raise IOError(
+            f"Cannot encode '{output_path}': no ffmpeg found.  "
+            "Install it via `pip install imageio-ffmpeg`, or put ffmpeg on PATH."
+        )
+
+    # cv2.VideoWriter's FFV1 produces pixel-exact frames that the watermark
+    # verifier can always decode.  It cannot carry audio, so we write a
+    # video-only temp file first and mux audio from the original input
+    # after the frame loop.
+    ffv1_temp_path: Optional[str] = None
     if ext in ('.mkv', '.avi'):
-        # Lossless FFV1 — watermark verifies cleanly.
         fourcc = cv2.VideoWriter_fourcc(*'FFV1')
-        out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+        base, ext_clean = os.path.splitext(output_path)
+        ffv1_temp_path = f"{base}.video_only{ext_clean}"
+        out = cv2.VideoWriter(ffv1_temp_path, fourcc, fps, (width, height))
         if not out.isOpened():
             raise IOError(f"Cannot open VideoWriter for {output_path} (FFV1 unavailable)")
     else:
-        # Lossy MP4 / etc. — pipe raw frames into ffmpeg+libx264.  OpenCV's
-        # own avc1 path on Windows depends on a matching openh264 DLL that
-        # is rarely installed; the legacy mp4v fallback is far too lossy for
-        # the watermark to survive.  ffmpeg with CRF=18 gives "visually
-        # lossless" H.264, which is the best shot at a verifiable watermark
-        # inside an MP4 container.
-        ffmpeg_exe = _find_ffmpeg()
-        if ffmpeg_exe is None:
-            raise IOError(
-                f"Cannot encode '{output_path}': no ffmpeg found.  "
-                "Install it via `pip install imageio-ffmpeg`, or put ffmpeg on PATH, "
-                "or write to .mkv / .avi for the lossless FFV1 path."
-            )
         out = _FFmpegWriter(output_path, fps=fps, width=width, height=height,
-                            ffmpeg_exe=ffmpeg_exe)
+                            ffmpeg_exe=ffmpeg_exe, audio_source_path=input_path)
         if not out.isOpened():
             raise IOError(f"Cannot start ffmpeg subprocess for {output_path}")
         print(f"[embed] Lossy '{ext}' output via ffmpeg+libx264 (CRF=18).  "
@@ -210,11 +227,12 @@ def embed_video(
     n_media_repeat_copies = None
 
     # Owner + media repeats are constant across the clip — build once.
-    # frame_id and chain_tag change per frame, so they're appended inside
-    # the loop.  Priority order matches embed_image:
-    #   owner → media → frame_id → chain_tag.
-    owner_repeated = np.tile(_owner_hash_bits_array(owner_id), OWNER_HASH_REPEATS)
-    media_repeated = np.tile(_media_hash_bits_array(media_id), OWNER_HASH_REPEATS)
+    # frame_id and chain_tag change per frame, so they're built inside the
+    # loop and PREPENDED (frame_id leads the stream — highest priority,
+    # lives in LLLL).  Priority order matches embed_image:
+    #   frame_id → owner_id → media_id → chain_tag.
+    owner_repeated = np.tile(_owner_id_bits_array(owner_id), OWNER_REPEATS)
+    media_repeated = np.tile(_media_id_bits_array(media_id), MEDIA_REPEATS)
     constant_extras = np.concatenate([owner_repeated, media_repeated])
 
     # Per-frame chain state: chain_i = SHA256(media_hash || chain_{i-1} || frame_id_i).
@@ -258,12 +276,15 @@ def embed_video(
                 n_meta_bits_raw   = len(meta_bits)
                 n_meta_bits_coded = len(meta_coded)
 
-            # Per-frame extras: constant owner+media chunk plus this frame's
-            # raw frame_id and chain_tag, each repeated for majority vote.
-            frame_id_repeated  = np.tile(_frame_id_bits_array(frame_idx),  OWNER_HASH_REPEATS)
-            chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag), OWNER_HASH_REPEATS)
-            extras             = np.concatenate([constant_extras,
-                                                 frame_id_repeated, chain_tag_repeated])
+            # Per-frame extras: frame_id (LEADS the stream — highest priority,
+            # lives in LLLL with 5x repeats per user spec), then constant
+            # owner+media block, then chain_tag.  Order MUST match
+            # embed_image's stream layout or verify drifts.
+            frame_id_repeated  = np.tile(_frame_id_bits_array(frame_idx),  FRAME_REPEATS)
+            chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag), CHAIN_REPEATS)
+            extras             = np.concatenate([frame_id_repeated,
+                                                 constant_extras,
+                                                 chain_tag_repeated])
 
             Y, Cb, Cr = to_float_ycbcr(rgb)
             Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_idx, extras)
@@ -286,28 +307,30 @@ def embed_video(
 
             if n_owner_repeat_copies is None:
                 # First successful frame defines how many full copies of each
-                # field fit in this video's LLLL; verify uses the same counts.
-                # Priority order: owner → media → frame_id → chain_tag.
+                # field fit in this video's LL-family capacity; verify uses
+                # the same counts.  Priority order matches the extras stream:
+                #   frame_id (5x) → owner_id (3x) → media_id (3x) → chain_tag (3x).
                 n_extra_emb = info["n_extra_llll_bits"]
-                n_owner_repeat_copies = min(OWNER_HASH_REPEATS, n_extra_emb // OWNER_HASH_BITS)
-                remaining             = max(0, n_extra_emb - n_owner_repeat_copies * OWNER_HASH_BITS)
-                n_media_repeat_copies = min(OWNER_HASH_REPEATS, remaining // OWNER_HASH_BITS)
-                remaining            -= n_media_repeat_copies * OWNER_HASH_BITS
-                n_frame_repeat_copies = min(OWNER_HASH_REPEATS, remaining // FRAME_ID_BITS)
-                remaining            -= n_frame_repeat_copies * FRAME_ID_BITS
-                n_chain_repeat_copies = min(OWNER_HASH_REPEATS, remaining // CHAIN_TAG_BITS)
-                n_owner_repeat_bits   = n_owner_repeat_copies * OWNER_HASH_BITS
-                n_media_repeat_bits   = n_media_repeat_copies * OWNER_HASH_BITS
+                n_frame_repeat_copies = min(FRAME_REPEATS, n_extra_emb // FRAME_ID_BITS)
+                remaining             = max(0, n_extra_emb - n_frame_repeat_copies * FRAME_ID_BITS)
+                n_owner_repeat_copies = min(OWNER_REPEATS, remaining // OWNER_ID_BITS)
+                remaining            -= n_owner_repeat_copies * OWNER_ID_BITS
+                n_media_repeat_copies = min(MEDIA_REPEATS, remaining // MEDIA_ID_BITS)
+                remaining            -= n_media_repeat_copies * MEDIA_ID_BITS
+                n_chain_repeat_copies = min(CHAIN_REPEATS, remaining // CHAIN_TAG_BITS)
                 n_frame_repeat_bits   = n_frame_repeat_copies * FRAME_ID_BITS
+                n_owner_repeat_bits   = n_owner_repeat_copies * OWNER_ID_BITS
+                n_media_repeat_bits   = n_media_repeat_copies * MEDIA_ID_BITS
                 n_chain_repeat_bits   = n_chain_repeat_copies * CHAIN_TAG_BITS
-                if any(c < OWNER_HASH_REPEATS for c in (
-                        n_owner_repeat_copies, n_media_repeat_copies,
-                        n_frame_repeat_copies, n_chain_repeat_copies)):
+                if (n_frame_repeat_copies < FRAME_REPEATS
+                        or n_owner_repeat_copies < OWNER_REPEATS
+                        or n_media_repeat_copies < MEDIA_REPEATS
+                        or n_chain_repeat_copies < CHAIN_REPEATS):
                     print(f"[embed_video] note: fit "
-                          f"{n_owner_repeat_copies}/{OWNER_HASH_REPEATS} owner + "
-                          f"{n_media_repeat_copies}/{OWNER_HASH_REPEATS} media + "
-                          f"{n_frame_repeat_copies}/{OWNER_HASH_REPEATS} frame_id + "
-                          f"{n_chain_repeat_copies}/{OWNER_HASH_REPEATS} chain_tag "
+                          f"{n_frame_repeat_copies}/{FRAME_REPEATS} frame_id + "
+                          f"{n_owner_repeat_copies}/{OWNER_REPEATS} owner_id + "
+                          f"{n_media_repeat_copies}/{MEDIA_REPEATS} media_id + "
+                          f"{n_chain_repeat_copies}/{CHAIN_REPEATS} chain_tag "
                           f"majority-vote copies per frame.")
 
             rgb_wm = from_float_ycbcr(Y_wm, Cb_wm, Cr)
@@ -336,6 +359,29 @@ def embed_video(
     cap.release()
     out.release()
 
+    # FFV1 path: cv2.VideoWriter wrote a video-only temp file.  Mux the
+    # audio stream from the original input into the final output via ffmpeg.
+    # ffmpeg_exe is guaranteed non-None (checked at the top of this function).
+    if ffv1_temp_path is not None:
+        mux_cmd = [
+            ffmpeg_exe, "-y", "-loglevel", "error",
+            "-i", ffv1_temp_path,
+            "-i", input_path,
+            "-map", "0:v:0",
+            "-map", "1:a?",
+            "-c", "copy",
+            output_path,
+        ]
+        result = subprocess.run(mux_cmd, capture_output=True)
+        if result.returncode == 0:
+            os.remove(ffv1_temp_path)
+        else:
+            err = result.stderr.decode("utf-8", errors="replace")
+            print(f"[embed_video] WARN: audio mux failed (exit {result.returncode}):\n{err}")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            shutil.move(ffv1_temp_path, output_path)
+
     # Aggregate PSNR stats (over embedded frames only; non-embedded frames
     # are written unchanged so they contribute infinite PSNR and aren't
     # interesting to report).  Ignore inf when computing min/max so a single
@@ -351,7 +397,7 @@ def embed_video(
     psnr_rgb_max  = float(np.max(psnr_rgb_finite))  if psnr_rgb_finite else float("inf")
 
     metadata = {
-        "version":               "v3",
+        "version":               "v4",
         "owner_id":              owner_id,
         "media_id":              media_id,
         "total_frames":          frame_idx,
@@ -361,17 +407,20 @@ def embed_video(
         "resolution":            f"{width}x{height}",
         "n_meta_bits_raw":       n_meta_bits_raw,
         "n_meta_bits_coded":     n_meta_bits_coded,
+        "frame_repeat_bits":     int(n_frame_repeat_bits or 0),
+        "frame_repeat_copies":   int(n_frame_repeat_copies or 0),
         "owner_repeat_bits":     int(n_owner_repeat_bits or 0),
         "owner_repeat_copies":   int(n_owner_repeat_copies or 0),
         "media_repeat_bits":     int(n_media_repeat_bits or 0),
         "media_repeat_copies":   int(n_media_repeat_copies or 0),
-        "frame_repeat_bits":     int(n_frame_repeat_bits or 0),
-        "frame_repeat_copies":   int(n_frame_repeat_copies or 0),
         "chain_repeat_bits":     int(n_chain_repeat_bits or 0),
         "chain_repeat_copies":   int(n_chain_repeat_copies or 0),
-        "owner_hash_bits":       int(OWNER_HASH_BITS),
+        "owner_id_bits":         int(OWNER_ID_BITS),
+        "media_id_bits":         int(MEDIA_ID_BITS),
         "frame_id_bits":         int(FRAME_ID_BITS),
         "chain_tag_bits":        int(CHAIN_TAG_BITS),
+        # Back-compat alias (kept for sidecars produced before the rename).
+        "owner_hash_bits":       int(OWNER_ID_BITS),
         "ber_threshold":         BER_TAMPER_THRESHOLD,
         # Pre-encoding PSNR — perturbation quality of the watermark itself
         # (Y-channel and RGB).  Codec degradation that follows is separate.
@@ -398,7 +447,9 @@ def verify_video(
     sample_frames: Optional[int] = 30,
     progress_callback=None,
 ) -> Dict:
-    cap = cv2.VideoCapture(video_path)
+    cap = cv2.VideoCapture(video_path, cv2.CAP_FFMPEG)
+    if not cap.isOpened():
+        cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise IOError(f"Cannot open video: {video_path}")
 
@@ -412,7 +463,9 @@ def verify_video(
     n_frame_repeat      = int(metadata.get("frame_repeat_bits", 0))
     n_chain_repeat      = int(metadata.get("chain_repeat_bits", 0))
     n_extra_total       = n_owner_repeat + n_media_repeat + n_frame_repeat + n_chain_repeat
-    expected_owner_h_hex, expected_media_h_hex = _meta_owner_media_hash(owner_id, media_id)
+    # Round-trip the IDs through encode→decode so comparisons match what the
+    # decoder will actually see after the fixed-length truncation/null-pad.
+    expected_owner_id, expected_media_id = _meta_owner_media_id(owner_id, media_id)
 
     # Use the embed-time frame count when available; container reports
     # are unreliable on some codecs.
@@ -465,12 +518,12 @@ def verify_video(
                 lsb_res          = _verify_lsb_chroma(Cb, signature, frame_idx)
                 combined_spatial = lsb_res["lsb_spatial_map"]
 
-                # Layout matches embed_video: owner → media → frame_id → chain_tag.
+                # Layout matches embed_video: frame_id → owner_id → media_id → chain_tag.
                 extra_bits       = res["extra_llll_bits"]
                 p = 0
+                frame_repeat_ext = extra_bits[p:p + n_frame_repeat]; p += n_frame_repeat
                 owner_repeat_ext = extra_bits[p:p + n_owner_repeat]; p += n_owner_repeat
                 media_repeat_ext = extra_bits[p:p + n_media_repeat]; p += n_media_repeat
-                frame_repeat_ext = extra_bits[p:p + n_frame_repeat]; p += n_frame_repeat
                 chain_repeat_ext = extra_bits[p:p + n_chain_repeat]
 
                 meta_bits, n_corr = bch_decode_bits(res["meta_bits_coded"])
@@ -478,8 +531,8 @@ def verify_video(
                 parsed     = _parse_meta_payload(meta_bytes)
 
 
-                owner_match = bool(parsed and parsed.get("owner_hash") == expected_owner_h_hex)
-                media_match = bool(parsed and parsed.get("media_hash") == expected_media_h_hex)
+                owner_match = bool(parsed and parsed.get("owner_id") == expected_owner_id)
+                media_match = bool(parsed and parsed.get("media_id") == expected_media_id)
                 frame_match = bool(parsed and parsed.get("frame") == frame_idx)
                 # Chain tag check: catches reorder / replay attacks where
                 # frame_id matches its iteration index but the frame actually
@@ -490,37 +543,38 @@ def verify_video(
                     and expected_chain_tag_hex is not None
                     and parsed.get("chain_tag") == expected_chain_tag_hex
                 )
-                owner_hash_out  = parsed.get("owner_hash") if parsed else None
-                media_hash_out  = parsed.get("media_hash") if parsed else None
+                owner_id_out    = parsed.get("owner_id") if parsed else None
+                media_id_out    = parsed.get("media_id") if parsed else None
                 recovery_method = "bch" if parsed is not None else "none"
 
-                # Majority-vote fallback for owner_hash when BCH miscorrected.
+                # Majority-vote fallback for owner_id (raw UTF-8 string).
+                # Recovers the actual identifier under compression — not a hash.
                 if (not owner_match
                         and n_owner_repeat > 0
-                        and len(owner_repeat_ext) >= OWNER_HASH_BITS * 2):
-                    voted = _majority_vote(owner_repeat_ext, OWNER_HASH_BITS)
+                        and len(owner_repeat_ext) >= OWNER_ID_BITS * 2):
+                    voted = _majority_vote(owner_repeat_ext, OWNER_ID_BITS)
                     if voted is not None:
-                        voted_hex = array_to_bytes(voted).hex()
-                        if voted_hex == expected_owner_h_hex:
+                        voted_str = _decode_id_fixed(array_to_bytes(voted)[:OWNER_ID_BYTES])
+                        if voted_str == expected_owner_id:
                             owner_match     = True
-                            owner_hash_out  = voted_hex
+                            owner_id_out    = voted_str
                             recovery_method = "majority_vote"
-                        elif owner_hash_out is None:
-                            owner_hash_out = voted_hex
+                        elif owner_id_out is None:
+                            owner_id_out = voted_str
 
-                # Majority-vote fallback for media_hash.
+                # Majority-vote fallback for media_id (raw UTF-8 string).
                 if (not media_match
                         and n_media_repeat > 0
-                        and len(media_repeat_ext) >= OWNER_HASH_BITS * 2):
-                    voted = _majority_vote(media_repeat_ext, OWNER_HASH_BITS)
+                        and len(media_repeat_ext) >= MEDIA_ID_BITS * 2):
+                    voted = _majority_vote(media_repeat_ext, MEDIA_ID_BITS)
                     if voted is not None:
-                        voted_hex = array_to_bytes(voted).hex()
-                        if voted_hex == expected_media_h_hex:
+                        voted_str = _decode_id_fixed(array_to_bytes(voted)[:MEDIA_ID_BYTES])
+                        if voted_str == expected_media_id:
                             media_match     = True
-                            media_hash_out  = voted_hex
+                            media_id_out    = voted_str
                             recovery_method = "majority_vote"
-                        elif media_hash_out is None:
-                            media_hash_out = voted_hex
+                        elif media_id_out is None:
+                            media_id_out = voted_str
 
                 # Majority-vote fallback for frame_id (temporal integrity).
                 # Expected frame_id at this iteration is just frame_idx.
@@ -590,8 +644,13 @@ def verify_video(
 
                 per_frame.append({
                     "frame_idx":               frame_idx,
-                    "owner_hash":              owner_hash_out,
-                    "media_hash":              media_hash_out,
+                    # Recovered RAW IDs (truncated UTF-8) — present even on
+                    # mismatch so the caller sees what came out of the watermark.
+                    "owner_id_recovered":      owner_id_out,
+                    "media_id_recovered":      media_id_out,
+                    # Back-compat keys (older callers read the "_hash" names).
+                    "owner_hash":              owner_id_out,
+                    "media_hash":              media_id_out,
                     "reported_frame":          parsed.get("frame") if parsed else None,
                     "reported_chain_tag":      parsed.get("chain_tag") if parsed else None,
                     "expected_chain_tag":      expected_chain_tag_hex,
@@ -632,7 +691,10 @@ def verify_video(
     observed_total_frames = frame_idx
     expected_total_frames = int(metadata.get("total_frames") or 0)
     frames_truncated      = max(0, expected_total_frames - observed_total_frames)
-    truncated             = bool(expected_total_frames > 0 and frames_truncated > 0)
+    # Tolerate up to 2 frames of difference: audio muxing can shift MKV
+    # container metadata so cv2 reads slightly fewer frames than were
+    # written.  Real truncation attacks remove many more frames.
+    truncated             = bool(expected_total_frames > 0 and frames_truncated > 2)
 
     spatial_arr  = np.stack(spatial_maps, axis=0) if spatial_maps else np.empty((0, 0, 0), bool)
     temporal_arr = np.array(temporal_map, dtype=bool)
