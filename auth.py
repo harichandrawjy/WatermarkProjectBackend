@@ -12,7 +12,7 @@ ourselves — Supabase does all of that. Our only job is:
 
 from fastapi import HTTPException, Header
 
-from db import supabase
+from db import supabase_auth
 
 
 def get_current_user(authorization: str | None = Header(None)) -> dict:
@@ -25,7 +25,7 @@ def get_current_user(authorization: str | None = Header(None)) -> dict:
         raise HTTPException(401, "Empty bearer token")
 
     try:
-        res = supabase.auth.get_user(token)
+        res = supabase_auth.auth.get_user(token)
     except Exception as e:
         raise HTTPException(401, f"Invalid token: {e}")
 

@@ -49,7 +49,7 @@ from watermark_engine import (
 )
 from video_watermark import embed_video, verify_video
 
-from db import supabase
+from db import supabase, supabase_auth
 
 # ── Storage layout ──
 STORAGE_DIR = Path(__file__).resolve().parent / "storage"
@@ -170,7 +170,7 @@ class AuthBody(BaseModel):
 @app.post("/auth/register")
 def auth_register(body: AuthBody):
     try:
-        res = supabase.auth.sign_up({"email": body.email, "password": body.password})
+        res = supabase_auth.auth.sign_up({"email": body.email, "password": body.password})
     except Exception as e:
         raise HTTPException(400, f"Registration failed: {e}")
 
@@ -192,7 +192,7 @@ def auth_register(body: AuthBody):
 @app.post("/auth/login")
 def auth_login(body: AuthBody):
     try:
-        res = supabase.auth.sign_in_with_password(
+        res = supabase_auth.auth.sign_in_with_password(
             {"email": body.email, "password": body.password}
         )
     except Exception as e:
