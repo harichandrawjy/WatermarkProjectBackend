@@ -184,7 +184,8 @@ def auth_register(body: AuthBody):
     # it can show a "check your inbox" screen.
     return {
         "user":               {"id": user.id, "email": user.email},
-        "access_token":       session.access_token if session else None,
+        "access_token":       session.access_token  if session else None,
+        "refresh_token":      session.refresh_token if session else None,
         "needs_confirmation": session is None,
     }
 
@@ -204,8 +205,38 @@ def auth_login(body: AuthBody):
         raise HTTPException(401, "Invalid credentials")
 
     return {
-        "user":         {"id": user.id, "email": user.email},
-        "access_token": session.access_token,
+        "user":          {"id": user.id, "email": user.email},
+        "access_token":  session.access_token,
+        "refresh_token": session.refresh_token,
+    }
+
+
+class RefreshBody(BaseModel):
+    refresh_token: str
+
+
+@app.post("/auth/refresh")
+def auth_refresh(body: RefreshBody):
+    """Exchange a refresh_token for a fresh access_token + refresh_token pair.
+
+    Supabase access tokens expire after ~1 hour. The frontend calls this
+    whenever it gets a 401 on an authed request, so users don't get
+    silently logged out mid-session.
+    """
+    try:
+        res = supabase_auth.auth.refresh_session(body.refresh_token)
+    except Exception as e:
+        raise HTTPException(401, f"Refresh failed: {e}")
+
+    session = getattr(res, "session", None)
+    user    = getattr(res, "user", None)
+    if not session or not user:
+        raise HTTPException(401, "Refresh token rejected")
+
+    return {
+        "user":          {"id": user.id, "email": user.email},
+        "access_token":  session.access_token,
+        "refresh_token": session.refresh_token,
     }
 
 
