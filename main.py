@@ -15,6 +15,7 @@ Endpoints:
 
 import sys
 import os
+import io
 import uuid
 import json
 import base64
@@ -42,7 +43,7 @@ from watermark_engine import (
     bch_decode_bits, array_to_bytes,
     to_float_ycbcr, META_PAYLOAD_BYTES,
     _BCH_N, _BCH_K,
-    _majority_vote, _decode_id_fixed,
+    _majority_vote, _decode_id_fixed, _encode_id_fixed,
     OWNER_ID_BITS, MEDIA_ID_BITS, FRAME_ID_BITS, CHAIN_TAG_BITS,
     OWNER_ID_BYTES, MEDIA_ID_BYTES,
     OWNER_REPEATS, MEDIA_REPEATS, FRAME_REPEATS, CHAIN_REPEATS,
@@ -139,6 +140,32 @@ def _spatial_to_regions(spatial_map):
                     "label": "modified_block",
                 })
     return regions
+
+
+def _pattern_to_data_url(grid, mismatch=None, scale: int = 10):
+    """Render a 2D 0/1 bit grid as an upscaled PNG data URL (black=0, white=1).
+
+    When `mismatch` (a same-shape bool array) is supplied, cells that differ
+    from the expected pattern are painted rose-red — so the extracted fragile
+    watermark visually shows exactly where tampering corrupted it.  Nearest-
+    neighbour upscaling keeps each bit a crisp square.
+    """
+    if grid is None:
+        return None
+    g = np.asarray(grid)
+    if g.ndim != 2 or g.size == 0:
+        return None
+    h, w = g.shape
+    val = ((g.astype(np.uint8) & 1) * 255).astype(np.uint8)
+    rgb = np.stack([val, val, val], axis=-1)        # white=1, black=0
+    if mismatch is not None:
+        m = np.asarray(mismatch).astype(bool)
+        if m.shape == g.shape:
+            rgb[m] = (244, 63, 94)                   # rose-500 — tampered bits
+    img = Image.fromarray(rgb, mode="RGB").resize((w * scale, h * scale), Image.NEAREST)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
 # ──────────────────────────────────────────────────────────────
@@ -249,6 +276,14 @@ def auth_me(user: dict = Depends(get_current_user)):
 # Encode / verify / lookup
 # ──────────────────────────────────────────────────────────────
 
+def _id_key(s: str, n_bytes: int) -> str:
+    """The exact lowercased 8-byte key that gets embedded for `s` — i.e. the
+    UTF-8 byte-truncated, null-stripped form, lowercased.  Encode stores this
+    in owner_key/media_key and lookup matches it exactly, so uniqueness and
+    resolution both operate on what the watermark actually carries."""
+    return _decode_id_fixed(_encode_id_fixed(s, n_bytes)).lower()
+
+
 @app.post("/encode")
 async def encode(
     file:     UploadFile = File(...),
@@ -259,6 +294,29 @@ async def encode(
     # The watermark engine truncates to OWNER_ID_BYTES (8), but the DB
     # keeps the full email so /lookup still works after compression.
     owner = user["email"]
+
+    # Uniqueness guard: an owner cannot reuse a media_id whose embedded 8-byte
+    # key collides with one they already have — otherwise blind /lookup could
+    # resolve to the wrong record.  Checked BEFORE embedding so we don't waste
+    # work or leave an orphan file; the DB unique index is the race-proof
+    # backstop (see migration 002).
+    owner_key = _id_key(owner,    OWNER_ID_BYTES)
+    media_key = _id_key(media_id, MEDIA_ID_BYTES)
+    dup = (
+        supabase.table("watermarks")
+        .select("id, media")
+        .eq("owner_key", owner_key)
+        .eq("media_key", media_key)
+        .limit(1)
+        .execute()
+    )
+    if dup.data:
+        raise HTTPException(
+            409,
+            f"You already have media_id '{dup.data[0].get('media')}' whose "
+            f"watermark key ('{media_key}') collides with '{media_id}'. "
+            f"Choose a media_id with a different first 8 characters."
+        )
 
     kind    = _detect_kind(file.filename)
     file_id = uuid.uuid4().hex[:12]
@@ -279,14 +337,29 @@ async def encode(
         meta     = embed_video(str(in_path), str(out_path), owner, media_id)
 
     meta_jsonable = _to_jsonable(meta)
-    supabase.table("watermarks").insert({
-        "id":       file_id,
-        "owner":    owner,
-        "media":    media_id,
-        "kind":     kind,
-        "metadata": meta_jsonable,
-        "user_id":  user["id"],
-    }).execute()
+    try:
+        supabase.table("watermarks").insert({
+            "id":        file_id,
+            "owner":     owner,
+            "media":     media_id,
+            "owner_key": owner_key,
+            "media_key": media_key,
+            "kind":      kind,
+            "metadata":  meta_jsonable,
+            "user_id":   user["id"],
+        }).execute()
+    except Exception as e:
+        # Race-proof backstop for the unique index — clean up the orphan file
+        # and surface a clear 409 instead of a raw 500.
+        out_path.unlink(missing_ok=True)
+        in_path.unlink(missing_ok=True)
+        if "duplicate" in str(e).lower() or "23505" in str(e):
+            raise HTTPException(
+                409,
+                f"media_id '{media_id}' (key '{media_key}') is already used by this owner. "
+                f"Choose a media_id with a different first 8 characters."
+            )
+        raise
 
     return {
         "id":              file_id,
@@ -446,14 +519,17 @@ async def lookup(file: UploadFile = File(...)):
     owner_id = parsed["owner_id"]
     media_id = parsed["media_id"]
 
-    # Watermark stores only the first 8 bytes of owner/media, but the
-    # database keeps the full original string.  Use case-insensitive prefix
-    # matching so "alice@st" (extracted) matches "alice@studio.com" (stored).
+    # Match on the exact embedded 8-byte key (lowercased), which is unique per
+    # owner (migration 002).  This is what the watermark actually carries, so
+    # resolution is unambiguous — no prefix over-matching where one id is a
+    # prefix of another.  The full owner/media strings are returned from the row.
+    owner_key = owner_id.lower()
+    media_key = media_id.lower()
     res = (
         supabase.table("watermarks")
         .select("*")
-        .ilike("owner", f"{owner_id}%")
-        .ilike("media", f"{media_id}%")
+        .eq("owner_key", owner_key)
+        .eq("media_key", media_key)
         .execute()
     )
 
@@ -511,7 +587,10 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int) -> di
         "fileName":        filename,
         "imageWidth":      int(width),
         "imageHeight":     int(height),
-        "tamperedRegions": _spatial_to_regions(v.get("spatial_map")),
+        # Only surface flagged regions on a real content edit — below the
+        # MIN_TAMPER_BLOCKS floor the flagged blocks are quantization noise, so
+        # we report none (consistent with the clean watermark comparison).
+        "tamperedRegions": _spatial_to_regions(v.get("spatial_map")) if v.get("content_tampered") else [],
         "watermarkFound":  bool(v["watermark_found"]),
         "ownerMatch":      bool(v["owner_match"]),
         "mediaMatch":      bool(v["media_match"]),
@@ -519,6 +598,11 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int) -> di
         "media":           v.get("media"),
         "blocksTampered":  int(v["n_blocks_tampered"]),
         "blocksTotal":     int(v["n_blocks_total"]),
+        # Fragile-watermark comparison images (PNG data URLs): the expected
+        # pattern vs. the one extracted from this file (tampered bits in red).
+        "watermarkOriginal":  _pattern_to_data_url(v.get("wm_target_pattern")),
+        "watermarkExtracted": _pattern_to_data_url(
+            v.get("wm_extracted_pattern"), v.get("wm_display_mismatch")),
     }
 
 
@@ -534,17 +618,44 @@ def _shape_video_response(v: dict, filename: str) -> dict:
 
     frame_results = []
     for i, t in enumerate(temporal):
+        pf = per_frame[i] if i < len(per_frame) else {}
+        # Only surface flagged regions for a real content edit on this frame —
+        # below the MIN_TAMPER_BLOCKS floor the blocks are quantization noise.
         per_frame_map = None
-        if spatial_arr is not None and hasattr(spatial_arr, "shape") \
+        if pf.get("content_tampered") and spatial_arr is not None \
+                and hasattr(spatial_arr, "shape") \
                 and spatial_arr.ndim == 3 and i < spatial_arr.shape[0]:
             per_frame_map = spatial_arr[i]
-        true_frame_idx = per_frame[i].get("frame_idx", i) if i < len(per_frame) else i
+        # Prefer the recovered embedded frame_id (the original frame number);
+        # fall back to playback position when it couldn't be recovered.
+        rec_fid = pf.get("rec_fid")
+        true_frame_idx = rec_fid if rec_fid is not None else pf.get("frame_idx", i)
         frame_results.append({
             "frame":           int(true_frame_idx),
             "status":          "tampered" if t else "authentic",
             "confidence":      0.5 if t else 0.95,
             "tamperedRegions": _spatial_to_regions(per_frame_map),
+            # Per-frame fragile-watermark comparison (present for every frame
+            # so the user can inspect whichever frame they select).
+            "watermarkOriginal":  _pattern_to_data_url(pf.get("wm_target_pattern")),
+            "watermarkExtracted": _pattern_to_data_url(
+                pf.get("wm_extracted_pattern"), pf.get("wm_display_mismatch")),
         })
+
+    # Re-insert deleted frames as red placeholders at their original position
+    # so the timeline still shows the full frame count (e.g. frame 5 deleted →
+    # 1-4 + [5 deleted] + 6-10), instead of collapsing to the survivors.  Their
+    # "original" watermark is shown next to a deleted placeholder on the front.
+    for mp in v.get("missing_frame_patterns", []) or []:
+        frame_results.append({
+            "frame":              int(mp["frame_id"]),
+            "status":             "deleted",
+            "confidence":         0.0,
+            "tamperedRegions":    [],
+            "watermarkOriginal":  _pattern_to_data_url(mp.get("target_pattern")),
+            "watermarkExtracted": None,   # nothing to extract — the frame is gone
+        })
+    frame_results.sort(key=lambda r: r["frame"])
 
     # Pixel dimensions derived from the spatial block grid so the frontend
     # heatmap scales correctly per video.
@@ -570,4 +681,12 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         "frameTamperRate": float(v.get("frame_tamper_rate", 0.0)),
         "chainBreaks":     int(v["frames_chain_break"]),
         "idMismatches":    int(v["frames_id_mismatch"]),
+        # Temporal localization — deletions/reorders surfaced as discrete
+        # events instead of cascading across every later frame.
+        "missingFrames":   [int(f) for f in v.get("missing_frame_ids", [])],
+        "framesDeleted":   int(v.get("frames_deleted", 0)),
+        "reordered":       bool(v.get("reordered", False)),
+        "reorderAt":       [int(x) for x in v.get("reorder_at", [])],
+        "duplicateFrames": [int(f) for f in v.get("duplicate_frame_ids", [])],
+        "framesTruncated": int(v.get("frames_truncated", 0)),
     }

@@ -536,16 +536,64 @@ def _verify_lsb_chroma(
     pattern = _compute_lsb_target_pattern(n_sub_h, n_sub_w, signature, frame_id)
     sub_mismatch = _verify_lsb_sub_block_parity(Cb, pattern)
     block_map = _aggregate_lsb_to_block_map(sub_mismatch)
+    # The pattern actually extracted from the (possibly tampered) chroma is the
+    # expected target XOR the per-sub-block mismatch — wherever they disagree,
+    # the extracted bit flipped.  Both grids are surfaced so callers can RENDER
+    # the original vs. extracted fragile watermark side by side.
+    actual_pattern = (pattern.astype(np.uint8) ^ sub_mismatch.astype(np.uint8))
     if target_shape is not None:
         h_min = min(block_map.shape[0], target_shape[0])
         w_min = min(block_map.shape[1], target_shape[1])
         block_map = block_map[:h_min, :w_min]
     return {
-        "lsb_spatial_map":  block_map,
-        "lsb_sub_mismatch": sub_mismatch,
+        "lsb_spatial_map":    block_map,
+        "lsb_sub_mismatch":   sub_mismatch,
+        "lsb_target_pattern": pattern.astype(np.uint8),
+        "lsb_actual_pattern": actual_pattern,
         "ber_lsb_sub":      float(sub_mismatch.mean()) if sub_mismatch.size else 0.0,
         "ber_lsb_block":    float(block_map.mean())    if block_map.size    else 0.0,
     }
+
+
+def _wm_display_patterns(lsb_res: Dict, content_tampered: bool) -> Tuple[np.ndarray, np.ndarray]:
+    """Build the (extracted_pattern, red_mask) used to VISUALISE the fragile
+    watermark, with the quantization noise-floor suppressed.
+
+    The raw `lsb_sub_mismatch` flags every sub-block whose parity flipped —
+    including the scattered, isolated flips caused by the RGB↔YCbCr round-trip
+    and codec noise.  Showing those as red on an AUTHENTIC result is
+    misleading ("authentic, but why is there red?").  So:
+
+      • content_tampered=False → return the expected pattern unchanged with an
+        all-False mask: the 'extracted' image is identical to the 'original'
+        and shows NO red at all.
+      • content_tampered=True  → red only on sub-blocks that fall inside a
+        32x32 block actually flagged by the ratio threshold (the real tampered
+        region).  Isolated noise flips outside any flagged block are dropped,
+        and the extracted image flips only those real bits.
+
+    This keeps the visualisation consistent with the verdict: clean when
+    authentic, localised red cluster when tampered.
+    """
+    target = lsb_res.get("lsb_target_pattern")
+    if target is None or target.size == 0:
+        empty = np.zeros((0, 0), dtype=np.uint8)
+        return empty, empty.astype(bool)
+    target = target.astype(np.uint8)
+    if not content_tampered:
+        return target, np.zeros(target.shape, dtype=bool)
+
+    sub_mismatch  = np.asarray(lsb_res["lsb_sub_mismatch"], dtype=bool)
+    block_map     = np.asarray(lsb_res["lsb_spatial_map"],  dtype=bool)
+    sub_per_block = SPATIAL_BLOCK // LSB_SUB_BLOCK_SIZE
+    # Upsample the coarse flagged-block grid back to the sub-block grid.
+    up = np.kron(block_map, np.ones((sub_per_block, sub_per_block), dtype=bool))
+    h = min(up.shape[0], sub_mismatch.shape[0])
+    w = min(up.shape[1], sub_mismatch.shape[1])
+    mask = np.zeros(sub_mismatch.shape, dtype=bool)
+    mask[:h, :w] = sub_mismatch[:h, :w] & up[:h, :w]
+    extracted = (target ^ mask.astype(np.uint8))
+    return extracted, mask
 
 
 
@@ -795,6 +843,47 @@ def _master_signature(owner_id: str, media_id: str, frame_id: int) -> bytes:
 
 
 # ──────────────────────────────────────────────────────────────
+# CAPACITY-AWARE REPEAT ALLOCATION
+# ──────────────────────────────────────────────────────────────
+
+def _llfamily_block_capacity(y_shape: Tuple[int, int]) -> int:
+    """Total 8x8-block payload slots across the level-2 LL-family subbands
+    (LLLL + LLLH + LLHL) for a Y channel of `y_shape` — i.e. how many bits
+    `_embed_into_channel` can carry.  Derived from the exact pywt subband
+    shapes so it matches the tiling used at embed time.
+    """
+    LL, _ = pywt.dwt2(np.zeros(y_shape, dtype=np.float64), WAVELET)
+    LLLL, (LLLH, LLHL, _LLHH) = pywt.dwt2(LL, WAVELET)
+    return sum((s.shape[0] // BLOCK_SIZE) * (s.shape[1] // BLOCK_SIZE)
+               for s in (LLLL, LLLH, LLHL))
+
+
+def _plan_repeat_copies(extra_capacity_bits: int,
+                        frame_repeats: int) -> Tuple[int, int, int, int]:
+    """Allocate majority-vote repeat copies across frame_id / owner_id /
+    media_id / chain_tag within the available LL-family capacity.
+
+    owner_id and media_id are allocated as PAIRS, so they always receive the
+    SAME number of copies — neither provenance field is starved.  This fixes
+    the old greedy frame→owner→media→chain order, where media_id routinely got
+    0 copies (no majority-vote recovery) while owner_id got 2, making media_id
+    the first thing to fail under compression.  frame_id leads (temporal,
+    lives in LLLL); chain_tag takes whatever remains.
+
+    Returns (n_frame, n_owner, n_media, n_chain).
+    """
+    rem = max(0, int(extra_capacity_bits))
+    nf = min(frame_repeats, rem // FRAME_ID_BITS)
+    rem -= nf * FRAME_ID_BITS
+    pair_bits = OWNER_ID_BITS + MEDIA_ID_BITS
+    pairs = min(OWNER_REPEATS, MEDIA_REPEATS, rem // pair_bits)
+    n_owner = n_media = pairs
+    rem -= pairs * pair_bits
+    nc = min(CHAIN_REPEATS, rem // CHAIN_TAG_BITS)
+    return nf, n_owner, n_media, nc
+
+
+# ──────────────────────────────────────────────────────────────
 # PUBLIC API — IMAGE
 # ──────────────────────────────────────────────────────────────
 
@@ -823,21 +912,26 @@ def embed_image(
     meta_bits   = bits_to_array(meta_raw)
     meta_coded  = bch_encode_bits(meta_bits)
 
-    # Raw repeated fields for majority-vote fallback when BCH miscorrects.
-    # Priority order (head of stream gets the strongest subband space —
-    # lower-priority fields get truncated first):
-    #   frame_id   (5x) — temporal integrity, lives in LLLL per user spec
-    #   owner_id   (3x) — provenance, raw bytes (recoverable string)
-    #   media_id   (3x) — provenance, raw bytes (recoverable string)
-    #   chain_tag  (3x) — replay/reorder detection
-    frame_id_repeated  = np.tile(_frame_id_bits_array(frame_id),    FRAME_REPEATS)
-    owner_repeated     = np.tile(_owner_id_bits_array(owner_id),    OWNER_REPEATS)
-    media_repeated     = np.tile(_media_id_bits_array(media_id),    MEDIA_REPEATS)
-    chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag),  CHAIN_REPEATS)
-    extras             = np.concatenate([frame_id_repeated, owner_repeated,
-                                         media_repeated,    chain_tag_repeated])
-
+    # Y channel first — its size determines the LL-family capacity, which we
+    # need before deciding how many majority-vote repeat copies to embed.
     Y, Cb, Cr = to_float_ycbcr(img_array[:,:,:3])
+
+    # Fair repeat allocation: owner_id and media_id get EQUAL copies so media
+    # is no longer starved.  A still image's frame_id is always 0 and already
+    # carried by the BCH meta, so a single raw copy suffices — the freed space
+    # goes to the provenance IDs.  (frame_id → owner_id ≡ media_id → chain_tag)
+    capacity_bits = _llfamily_block_capacity(Y.shape)
+    extra_cap     = capacity_bits - len(meta_coded)
+    n_frame_copies, n_owner_copies, n_media_copies, n_chain_copies = \
+        _plan_repeat_copies(extra_cap, frame_repeats=1)
+
+    extras = np.concatenate([
+        np.tile(_frame_id_bits_array(frame_id),   n_frame_copies),
+        np.tile(_owner_id_bits_array(owner_id),    n_owner_copies),
+        np.tile(_media_id_bits_array(media_id),    n_media_copies),
+        np.tile(_chain_tag_bits_array(chain_tag),  n_chain_copies),
+    ]).astype(np.uint8)
+
     Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_id, extras)
 
     # LSB layer on chroma — independent of Y's DCT/SVD watermark.
@@ -848,31 +942,18 @@ def embed_image(
             f"BCH-coded meta bits.  Use a larger image or shorter owner/media IDs."
         )
 
-    # Tally how many FULL copies of each fit (partial copies can't vote).
-    # Priority order: frame_id → owner_id → media_id → chain_tag.
-    n_extra_emb       = info["n_extra_llll_bits"]
-    n_frame_copies    = min(FRAME_REPEATS, n_extra_emb // FRAME_ID_BITS)
-    remaining         = max(0, n_extra_emb - n_frame_copies * FRAME_ID_BITS)
-    n_owner_copies    = min(OWNER_REPEATS, remaining // OWNER_ID_BITS)
-    remaining        -= n_owner_copies * OWNER_ID_BITS
-    n_media_copies    = min(MEDIA_REPEATS, remaining // MEDIA_ID_BITS)
-    remaining        -= n_media_copies * MEDIA_ID_BITS
-    n_chain_copies    = min(CHAIN_REPEATS, remaining // CHAIN_TAG_BITS)
-
     n_frame_bits  = n_frame_copies * FRAME_ID_BITS
     n_owner_bits  = n_owner_copies * OWNER_ID_BITS
     n_media_bits  = n_media_copies * MEDIA_ID_BITS
     n_chain_bits  = n_chain_copies * CHAIN_TAG_BITS
 
-    if (n_frame_copies < FRAME_REPEATS or n_owner_copies < OWNER_REPEATS
-            or n_media_copies < MEDIA_REPEATS or n_chain_copies < CHAIN_REPEATS):
+    if n_owner_copies < OWNER_REPEATS or n_media_copies < MEDIA_REPEATS:
         print(f"[embed_image] note: fit "
-              f"{n_frame_copies}/{FRAME_REPEATS} frame_id + "
+              f"{n_frame_copies} frame_id + "
               f"{n_owner_copies}/{OWNER_REPEATS} owner_id + "
               f"{n_media_copies}/{MEDIA_REPEATS} media_id + "
               f"{n_chain_copies}/{CHAIN_REPEATS} chain_tag majority-vote copies "
-              f"(used LLLL={info.get('n_bits_llll',0)} LLLH={info.get('n_bits_lllh',0)} "
-              f"LLHL={info.get('n_bits_llhl',0)} bits).")
+              f"(LL-family capacity {capacity_bits} bits).")
 
     rgb = from_float_ycbcr(Y_wm, Cb_wm, Cr)
     mse = np.mean((img_array[:,:,:3].astype(np.float64) - rgb.astype(np.float64)) ** 2)
@@ -1054,12 +1135,22 @@ def verify_image(
         ber_lsb_sub    = lsb_res["ber_lsb_sub"]
         ber_lsb_block  = lsb_res["ber_lsb_block"]
         spatial        = lsb_block_map
+        # Noise-suppressed watermark visualisation: red only when the image is
+        # genuinely content-tampered (≥ MIN_TAMPER_BLOCKS flagged), and only on
+        # sub-blocks inside a flagged 32x32 block.  Authentic → zero red.
+        content_tampered_img      = bool(int(spatial.sum()) >= MIN_TAMPER_BLOCKS)
+        wm_target                 = lsb_res["lsb_target_pattern"]
+        wm_extracted, wm_display_mismatch = _wm_display_patterns(lsb_res, content_tampered_img)
     else:
         # Greyscale input — no chroma available, no spatial map.
         lsb_block_map  = np.zeros((0, 0), dtype=bool)
         lsb_sub_mis    = np.zeros((0, 0), dtype=bool)
         ber_lsb_sub    = 0.0
         ber_lsb_block  = 0.0
+        wm_target      = np.zeros((0, 0), dtype=np.uint8)
+        wm_extracted   = np.zeros((0, 0), dtype=np.uint8)
+        wm_display_mismatch = np.zeros((0, 0), dtype=bool)
+        content_tampered_img = False
         spatial        = lsb_block_map
 
     ber_combined = float(spatial.mean()) if spatial.size else 0.0
@@ -1100,6 +1191,17 @@ def verify_image(
         "spatial_map":         spatial,
         "lsb_spatial_map":     lsb_block_map,
         "lsb_sub_mismatch":    lsb_sub_mis,
+        # Fragile-watermark bit grids (0/1) for visual comparison: the
+        # expected pattern vs. what was actually extracted from this file.
+        # The display mismatch is noise-suppressed (red only on real tamper).
+        "wm_target_pattern":     wm_target,
+        "wm_extracted_pattern":  wm_extracted,
+        "wm_display_mismatch":   wm_display_mismatch,
+        # True only when ≥ MIN_TAMPER_BLOCKS blocks are flagged — i.e. a real
+        # content edit, not the quantization noise floor.  Drives whether the
+        # frontend shows any flagged regions / heatmap (keeps it consistent
+        # with the noise-suppressed watermark comparison).
+        "content_tampered":    content_tampered_img,
         "n_blocks_total":      int(spatial.size),
         "n_blocks_tampered":   int(spatial.sum()),
         # Tamper rule: any block flagged, identity broken, or temporal mismatch.

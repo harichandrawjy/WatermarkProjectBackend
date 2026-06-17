@@ -32,6 +32,8 @@ from watermark_engine import (
     to_float_ycbcr, from_float_ycbcr,
     _embed_into_channel, _verify_channel,
     _embed_lsb_chroma, _verify_lsb_chroma,
+    _compute_lsb_target_pattern, _wm_display_patterns,
+    _llfamily_block_capacity, _plan_repeat_copies,
 
     _build_meta_payload, _parse_meta_payload,
     _master_signature, _meta_owner_media_id,
@@ -221,30 +223,45 @@ def embed_video(
     embedded_indices: List[int] = []
     n_meta_bits_raw = None
     n_meta_bits_coded = None
-    n_owner_repeat_bits = None
-    n_owner_repeat_copies = None
-    n_media_repeat_bits = None
-    n_media_repeat_copies = None
+
+    # Fair repeat allocation, computed once for the clip (capacity is constant
+    # per resolution).  owner_id and media_id get EQUAL copies so media is no
+    # longer starved.  frame_id keeps its full repeats here (temporal integrity
+    # / deletion localization needs to recover frame_id under compression).
+    # Layout order: frame_id → owner_id → media_id → chain_tag.
+    _meta_len_bits = len(bch_encode_bits(
+        bits_to_array(_build_meta_payload(owner_id, media_id, 0, b"\x00\x00"))))
+    capacity_bits  = _llfamily_block_capacity((height, width))
+    n_frame_copies, n_owner_copies, n_media_copies, n_chain_copies = \
+        _plan_repeat_copies(capacity_bits - _meta_len_bits, frame_repeats=FRAME_REPEATS)
+    if n_owner_copies < OWNER_REPEATS or n_media_copies < MEDIA_REPEATS:
+        print(f"[embed_video] note: fit {n_frame_copies} frame_id + "
+              f"{n_owner_copies}/{OWNER_REPEATS} owner_id + "
+              f"{n_media_copies}/{MEDIA_REPEATS} media_id + "
+              f"{n_chain_copies}/{CHAIN_REPEATS} chain_tag copies/frame "
+              f"(LL-family capacity {capacity_bits} bits).")
 
     # Owner + media repeats are constant across the clip — build once.
-    # frame_id and chain_tag change per frame, so they're built inside the
-    # loop and PREPENDED (frame_id leads the stream — highest priority,
-    # lives in LLLL).  Priority order matches embed_image:
-    #   frame_id → owner_id → media_id → chain_tag.
-    owner_repeated = np.tile(_owner_id_bits_array(owner_id), OWNER_REPEATS)
-    media_repeated = np.tile(_media_id_bits_array(media_id), MEDIA_REPEATS)
-    constant_extras = np.concatenate([owner_repeated, media_repeated])
+    owner_repeated = np.tile(_owner_id_bits_array(owner_id), n_owner_copies)
+    media_repeated = np.tile(_media_id_bits_array(media_id), n_media_copies)
+    constant_extras = np.concatenate([owner_repeated, media_repeated]).astype(np.uint8)
+
+    # Bit/copy tallies recorded in the metadata (verify slices the extra stream
+    # by these counts, in frame → owner → media → chain order).
+    n_frame_repeat_copies = n_frame_copies
+    n_owner_repeat_copies = n_owner_copies
+    n_media_repeat_copies = n_media_copies
+    n_chain_repeat_copies = n_chain_copies
+    n_frame_repeat_bits   = n_frame_copies * FRAME_ID_BITS
+    n_owner_repeat_bits   = n_owner_copies * OWNER_ID_BITS
+    n_media_repeat_bits   = n_media_copies * MEDIA_ID_BITS
+    n_chain_repeat_bits   = n_chain_copies * CHAIN_TAG_BITS
 
     # Per-frame chain state: chain_i = SHA256(media_hash || chain_{i-1} || frame_id_i).
     # First 2 bytes embedded as chain_tag in LLLL.  Catches reorder / replay
     # attacks that frame_id alone misses.
     media_hash_bytes = hashlib.sha256(media_id.encode()).digest()[:4]
     chain_state      = _chain_genesis(media_hash_bytes)
-
-    n_frame_repeat_bits   = None
-    n_frame_repeat_copies = None
-    n_chain_repeat_bits   = None
-    n_chain_repeat_copies = None
 
     # Per-frame PSNR (pre-encoding — measures the watermark's perturbation
     # only, NOT the codec's compression noise that follows).
@@ -276,12 +293,12 @@ def embed_video(
                 n_meta_bits_raw   = len(meta_bits)
                 n_meta_bits_coded = len(meta_coded)
 
-            # Per-frame extras: frame_id (LEADS the stream — highest priority,
-            # lives in LLLL with 5x repeats per user spec), then constant
-            # owner+media block, then chain_tag.  Order MUST match
-            # embed_image's stream layout or verify drifts.
-            frame_id_repeated  = np.tile(_frame_id_bits_array(frame_idx),  FRAME_REPEATS)
-            chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag), CHAIN_REPEATS)
+            # Per-frame extras: frame_id LEADS the stream (highest priority,
+            # lives in LLLL), then the constant owner+media block, then
+            # chain_tag.  Copy counts come from the fair plan above; order MUST
+            # match the verify-side slicing (frame → owner → media → chain).
+            frame_id_repeated  = np.tile(_frame_id_bits_array(frame_idx),  n_frame_copies)
+            chain_tag_repeated = np.tile(_chain_tag_bits_array(chain_tag), n_chain_copies)
             extras             = np.concatenate([frame_id_repeated,
                                                  constant_extras,
                                                  chain_tag_repeated])
@@ -304,34 +321,6 @@ def embed_video(
                     f"({info['n_meta_bits']}/{len(meta_coded)} BCH-coded meta bits). "
                     f"Use a larger video or shorter owner/media IDs."
                 )
-
-            if n_owner_repeat_copies is None:
-                # First successful frame defines how many full copies of each
-                # field fit in this video's LL-family capacity; verify uses
-                # the same counts.  Priority order matches the extras stream:
-                #   frame_id (5x) → owner_id (3x) → media_id (3x) → chain_tag (3x).
-                n_extra_emb = info["n_extra_llll_bits"]
-                n_frame_repeat_copies = min(FRAME_REPEATS, n_extra_emb // FRAME_ID_BITS)
-                remaining             = max(0, n_extra_emb - n_frame_repeat_copies * FRAME_ID_BITS)
-                n_owner_repeat_copies = min(OWNER_REPEATS, remaining // OWNER_ID_BITS)
-                remaining            -= n_owner_repeat_copies * OWNER_ID_BITS
-                n_media_repeat_copies = min(MEDIA_REPEATS, remaining // MEDIA_ID_BITS)
-                remaining            -= n_media_repeat_copies * MEDIA_ID_BITS
-                n_chain_repeat_copies = min(CHAIN_REPEATS, remaining // CHAIN_TAG_BITS)
-                n_frame_repeat_bits   = n_frame_repeat_copies * FRAME_ID_BITS
-                n_owner_repeat_bits   = n_owner_repeat_copies * OWNER_ID_BITS
-                n_media_repeat_bits   = n_media_repeat_copies * MEDIA_ID_BITS
-                n_chain_repeat_bits   = n_chain_repeat_copies * CHAIN_TAG_BITS
-                if (n_frame_repeat_copies < FRAME_REPEATS
-                        or n_owner_repeat_copies < OWNER_REPEATS
-                        or n_media_repeat_copies < MEDIA_REPEATS
-                        or n_chain_repeat_copies < CHAIN_REPEATS):
-                    print(f"[embed_video] note: fit "
-                          f"{n_frame_repeat_copies}/{FRAME_REPEATS} frame_id + "
-                          f"{n_owner_repeat_copies}/{OWNER_REPEATS} owner_id + "
-                          f"{n_media_repeat_copies}/{MEDIA_REPEATS} media_id + "
-                          f"{n_chain_repeat_copies}/{CHAIN_REPEATS} chain_tag "
-                          f"majority-vote copies per frame.")
 
             rgb_wm = from_float_ycbcr(Y_wm, Cb_wm, Cr)
             bgr_wm = cv2.cvtColor(rgb_wm, cv2.COLOR_RGB2BGR)
@@ -496,6 +485,12 @@ def verify_video(
     for emb_idx in embedded_indices:
         _chain_running = _frame_chain_hash(media_hash_bytes, _chain_running, emb_idx)
         expected_chain_tags[emb_idx] = _chain_running[:2].hex()
+    # The full set of frame_ids that were embedded at encode time.  Temporal
+    # anomalies (deletion / reorder / replay) are derived by comparing the
+    # SEQUENCE of recovered frame_ids against this set after the walk — never
+    # by comparing a frame's recovered id to its playback index, which would
+    # cascade (deleting one frame shifts every later index by one).
+    expected_fids_set = set(embedded_indices)
 
     frame_idx = 0
     while True:
@@ -507,16 +502,15 @@ def verify_video(
             if frame_idx in indices_to_verify:
                 rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
                 Y, Cb, _ = to_float_ycbcr(rgb)
-                signature = _master_signature(owner_id, media_id, frame_idx)
 
+                # _verify_channel ignores signature/frame_id for bit extraction,
+                # so we can decode the stream BEFORE knowing which frame this
+                # actually is.  The fragile LSB layer IS keyed by the frame id,
+                # so it's verified further down — once rec_fid is recovered.
                 res = _verify_channel(
-                    Y, n_meta_bits_coded, signature, frame_idx,
+                    Y, n_meta_bits_coded, b"", frame_idx,
                     n_extra_llll_bits=n_extra_total,
                 )
-
-                # Spatial map: chroma LSB block-mean parity (compression-robust).
-                lsb_res          = _verify_lsb_chroma(Cb, signature, frame_idx)
-                combined_spatial = lsb_res["lsb_spatial_map"]
 
                 # Layout matches embed_video: frame_id → owner_id → media_id → chain_tag.
                 extra_bits       = res["extra_llll_bits"]
@@ -533,12 +527,44 @@ def verify_video(
 
                 owner_match = bool(parsed and parsed.get("owner_id") == expected_owner_id)
                 media_match = bool(parsed and parsed.get("media_id") == expected_media_id)
-                frame_match = bool(parsed and parsed.get("frame") == frame_idx)
-                # Chain tag check: catches reorder / replay attacks where
-                # frame_id matches its iteration index but the frame actually
-                # came from a different position in the original clip.
-                expected_chain_tag_hex = expected_chain_tags.get(frame_idx)
-                chain_match  = bool(
+
+                # ── Recover this frame's embedded frame_id (source of truth
+                # for ordering) ──────────────────────────────────────────────
+                # BCH first, then majority-vote on the 5× frame_id repeats.
+                # rec_fid is what the frame CLAIMS to be; temporal anomalies
+                # are derived from the SEQUENCE of rec_fids after the walk —
+                # never by comparing rec_fid to the playback index.
+                rec_fid = parsed.get("frame") if parsed else None
+                frame_recovery_local = "bch" if rec_fid is not None else "none"
+                if (rec_fid is None
+                        and n_frame_repeat > 0
+                        and len(frame_repeat_ext) >= FRAME_ID_BITS * 2):
+                    voted = _majority_vote(frame_repeat_ext, FRAME_ID_BITS)
+                    if voted is not None:
+                        try:
+                            rec_fid = struct.unpack(">I", array_to_bytes(voted)[:4])[0]
+                            frame_recovery_local = "majority_vote"
+                        except Exception:
+                            rec_fid = None
+
+                # ── Fragile LSB layer, keyed by the frame's OWN id ──
+                # The chroma LSB pattern derives from signature(owner|media|
+                # frame_id).  Verifying with the RECOVERED id (not the playback
+                # index) means a deletion that shifts later frames' positions no
+                # longer desyncs the pattern → those survivors stay clean.  Fall
+                # back to the playback index when the id couldn't be recovered.
+                sig_fid          = rec_fid if rec_fid is not None else frame_idx
+                signature        = _master_signature(owner_id, media_id, sig_fid)
+                lsb_res          = _verify_lsb_chroma(Cb, signature, sig_fid)
+                combined_spatial = lsb_res["lsb_spatial_map"]
+
+                # Chain tag is validated against the expected chain for THIS
+                # frame's OWN recovered frame_id — so a survivor keeps matching
+                # even when other frames around it were deleted (the chain is
+                # keyed by frame_id, not by playback position).
+                expected_chain_tag_hex = (
+                    expected_chain_tags.get(rec_fid) if rec_fid is not None else None)
+                chain_match = bool(
                     parsed
                     and expected_chain_tag_hex is not None
                     and parsed.get("chain_tag") == expected_chain_tag_hex
@@ -576,22 +602,7 @@ def verify_video(
                         elif media_id_out is None:
                             media_id_out = voted_str
 
-                # Majority-vote fallback for frame_id (temporal integrity).
-                # Expected frame_id at this iteration is just frame_idx.
-                expected_frame_id_hex = struct.pack(">I", frame_idx).hex()
-                frame_recovery_local  = "bch" if frame_match else "none"
-                if (not frame_match
-                        and n_frame_repeat > 0
-                        and len(frame_repeat_ext) >= FRAME_ID_BITS * 2):
-                    voted = _majority_vote(frame_repeat_ext, FRAME_ID_BITS)
-                    if voted is not None:
-                        voted_hex = array_to_bytes(voted).hex()
-                        if voted_hex == expected_frame_id_hex:
-                            frame_match          = True
-                            frame_recovery_local = "majority_vote"
-                            recovery_method      = "majority_vote"
-
-                # Majority-vote fallback for chain_tag.
+                # Majority-vote fallback for chain_tag, keyed by rec_fid.
                 chain_recovery_local = "bch" if chain_match else "none"
                 if (not chain_match
                         and n_chain_repeat > 0
@@ -605,76 +616,68 @@ def verify_video(
                             chain_recovery_local = "majority_vote"
                             recovery_method      = "majority_vote"
 
-                # Temporal integrity: TWO independent checks.
-                #   (a) frame_id mismatch — embedded frame_id != iteration
-                #       index.  Catches deletion / insertion / unwatermarked-
-                #       splice.  Flagged via `frame_match`.
-                #   (b) chain_tag mismatch — embedded chain_tag != expected
-                #       chain_tag for this iteration.  Catches reorder /
-                #       replay attacks where two frames from the SAME media
-                #       were swapped (both have valid frame_ids individually
-                #       but the chain depends on the original sequence).
-                #       Flagged via `chain_match`.
-                # Only counted when BCH actually parsed (parsed is not None);
-                # codec noise that fails BCH is handled by majority-vote on
-                # the owner/media copies, not by these signals.
-                chain_ok = frame_match and (chain_match or parsed is None)
+                # frame_id is "valid" when recovered AND it is one of the
+                # originally-embedded ids.  Whether it sits at the right
+                # POSITION is a sequence-level question handled after the loop.
+                frame_id_valid = bool(rec_fid is not None and rec_fid in expected_fids_set)
 
-                explicit_frame_mismatch = bool(
-                    parsed is not None and parsed.get("frame") != frame_idx
-                )
-                explicit_chain_mismatch = bool(parsed is not None and not chain_match)
-                explicit_owner_mismatch = bool(parsed is not None and not owner_match)
-                explicit_media_mismatch = bool(parsed is not None and not media_match)
-
-                # Content tamper: enough blocks flagged in the LSB-only spatial
-                # map to clear the noise floor (see MIN_TAMPER_BLOCKS).  The
-                # heatmap still shows every flagged block individually — this
-                # only gates the per-frame verdict.
+                # ── Per-frame integrity (NO position/index comparison here) ──
+                # A frame is tampered if its content blocks are flagged, its
+                # identity is broken, or its chain_tag is inconsistent with its
+                # OWN frame_id (a forged / content-altered frame).  Deleting
+                # OTHER frames leaves all of these clean for the survivors, so
+                # there is no cascade.
                 content_tampered = bool(int(combined_spatial.sum()) >= MIN_TAMPER_BLOCKS)
-                frame_tampered   = (
-                    content_tampered
-                    or not (owner_match and media_match)
-                    or not chain_ok
-                )
+                self_chain_bad   = bool(parsed is not None and frame_id_valid and not chain_match)
+                id_mismatch      = not (owner_match and media_match)
+                frame_tampered   = bool(content_tampered or id_mismatch or self_chain_bad)
+
+                # Noise-suppressed watermark visualisation: red only on real
+                # content tamper (clean frames show NO red at all).
+                wm_ext_disp, wm_mask_disp = _wm_display_patterns(lsb_res, content_tampered)
 
                 spatial_maps.append(combined_spatial)
 
                 temporal_map.append(frame_tampered)
 
                 per_frame.append({
-                    "frame_idx":               frame_idx,
+                    "frame_idx":          frame_idx,     # playback position in this file
+                    "rec_fid":            rec_fid,       # recovered embedded frame_id
                     # Recovered RAW IDs (truncated UTF-8) — present even on
                     # mismatch so the caller sees what came out of the watermark.
-                    "owner_id_recovered":      owner_id_out,
-                    "media_id_recovered":      media_id_out,
+                    "owner_id_recovered": owner_id_out,
+                    "media_id_recovered": media_id_out,
                     # Back-compat keys (older callers read the "_hash" names).
-                    "owner_hash":              owner_id_out,
-                    "media_hash":              media_id_out,
-                    "reported_frame":          parsed.get("frame") if parsed else None,
-                    "reported_chain_tag":      parsed.get("chain_tag") if parsed else None,
-                    "expected_chain_tag":      expected_chain_tag_hex,
-                    "owner_match":             owner_match,
-                    "media_match":             media_match,
-                    "frame_match":             frame_match,
-                    "chain_match":             chain_match,
-                    "chain_ok":                chain_ok,
-                    "explicit_frame_mismatch": explicit_frame_mismatch,
-                    "explicit_chain_mismatch": explicit_chain_mismatch,
-                    "explicit_owner_mismatch": explicit_owner_mismatch,
-                    "explicit_media_mismatch": explicit_media_mismatch,
-                    "recovery_method":         recovery_method,
-                    "frame_recovery":          frame_recovery_local,
-                    "chain_recovery":          chain_recovery_local,
-                    "ber":                     float(combined_spatial.mean()) if combined_spatial.size else 0.0,
-                    "ber_lsb_sub":             lsb_res["ber_lsb_sub"],
-                    "ber_lsb_block":           lsb_res["ber_lsb_block"],
-                    "bch_corrections":         int(n_corr),
-                    "content_tampered":        bool(content_tampered),
-                    "frame_tampered":          bool(frame_tampered),
-                                        "n_blocks_tampered":       int(combined_spatial.sum()),
-                    "n_blocks_total":          int(combined_spatial.size),
-
+                    "owner_hash":         owner_id_out,
+                    "media_hash":         media_id_out,
+                    "reported_frame":     rec_fid,
+                    "reported_chain_tag": parsed.get("chain_tag") if parsed else None,
+                    "expected_chain_tag": expected_chain_tag_hex,
+                    "owner_match":        owner_match,
+                    "media_match":        media_match,
+                    "chain_match":        chain_match,
+                    "frame_id_valid":     frame_id_valid,
+                    "recovery_method":    recovery_method,
+                    "frame_recovery":     frame_recovery_local,
+                    "chain_recovery":     chain_recovery_local,
+                    "ber":                float(combined_spatial.mean()) if combined_spatial.size else 0.0,
+                    "ber_lsb_sub":        lsb_res["ber_lsb_sub"],
+                    "ber_lsb_block":      lsb_res["ber_lsb_block"],
+                    "bch_corrections":    int(n_corr),
+                    "content_tampered":   bool(content_tampered),
+                    "self_chain_bad":     bool(self_chain_bad),
+                    "id_mismatch":        bool(id_mismatch),
+                    "frame_tampered":     bool(frame_tampered),
+                    "n_blocks_tampered":  int(combined_spatial.sum()),
+                    "n_blocks_total":     int(combined_spatial.size),
+                    # Fragile-watermark grids for every verified frame so the
+                    # frontend can show the original-vs-extracted comparison on
+                    # whichever frame is selected (rendered to PNG in main.py).
+                    # The extracted grid + mask are noise-suppressed: clean
+                    # frames show NO red, only real tamper does.
+                    "wm_target_pattern":    lsb_res["lsb_target_pattern"],
+                    "wm_extracted_pattern": wm_ext_disp,
+                    "wm_display_mismatch":  wm_mask_disp,
                 })
 
         if progress_callback:
@@ -700,16 +703,56 @@ def verify_video(
     temporal_arr = np.array(temporal_map, dtype=bool)
 
     n_tampered_frames   = int(temporal_arr.sum())
-    n_chain_breaks      = sum(1 for r in per_frame if not r["chain_ok"])
+    n_self_chain_bad    = sum(1 for r in per_frame if r["self_chain_bad"])
     n_content_tampered  = sum(1 for r in per_frame if r["content_tampered"])
-    n_id_mismatch       = sum(1 for r in per_frame if not (r["owner_match"] and r["media_match"]))
+    n_id_mismatch       = sum(1 for r in per_frame if r["id_mismatch"])
     n_owner_match       = sum(1 for r in per_frame if r["owner_match"])
     n_media_match       = sum(1 for r in per_frame if r["media_match"])
-    n_explicit_frame_mismatch = sum(1 for r in per_frame if r["explicit_frame_mismatch"])
-    n_explicit_chain_mismatch = sum(1 for r in per_frame if r["explicit_chain_mismatch"])
-    n_explicit_owner_mismatch = sum(1 for r in per_frame if r["explicit_owner_mismatch"])
-    n_explicit_media_mismatch = sum(1 for r in per_frame if r["explicit_media_mismatch"])
     avg_ber             = float(np.mean([r["ber"] for r in per_frame])) if per_frame else 0.0
+
+    # ── Temporal sequence analysis (deletion / reorder / replay) ──────────
+    # Localize by the SEQUENCE of recovered frame_ids rather than per-frame
+    # index comparison — so deleting one frame surfaces as ONE missing id,
+    # not a cascade across every later frame.
+    playback_fids = [r["rec_fid"] for r in per_frame]
+    known_fids    = [f for f in playback_fids if f is not None]
+    recovered_set = set(known_fids)
+    # Frame_ids that were embedded but never showed up → deleted (or, under
+    # heavy compression, unrecoverable).  This is the localized deletion list.
+    missing_frame_ids = [int(f) for f in embedded_indices if f not in recovered_set]
+
+    # Expected fragile-watermark pattern for each deleted frame_id, so the
+    # frontend can still show its "original" watermark next to a "frame
+    # deleted — nothing to extract" placeholder.  Deterministic from the
+    # signature; the grid shape matches the verified frames' patterns.
+    pattern_shape = None
+    for r in per_frame:
+        tp = r.get("wm_target_pattern")
+        if tp is not None and hasattr(tp, "shape"):
+            pattern_shape = tp.shape
+            break
+    missing_frame_patterns: List[Dict] = []
+    if pattern_shape is not None:
+        n_sub_h, n_sub_w = pattern_shape
+        for fid in missing_frame_ids:
+            sig = _master_signature(owner_id, media_id, fid)
+            target = _compute_lsb_target_pattern(n_sub_h, n_sub_w, sig, fid)
+            missing_frame_patterns.append({
+                "frame_id":       fid,
+                "target_pattern": target.astype(np.uint8),
+            })
+    # Reorder / replay: recovered ids must strictly increase in playback order.
+    reorder_at: List[int] = []
+    duplicate_frame_ids   = sorted(int(f) for f in recovered_set if known_fids.count(f) > 1)
+    _prev = None
+    for r in per_frame:
+        f = r["rec_fid"]
+        if f is None:
+            continue
+        if _prev is not None and f <= _prev:
+            reorder_at.append(int(r["frame_idx"]))
+        _prev = f
+    reordered = bool(reorder_at)
 
     majority = max(len(per_frame) / 2, 1)
     owner_out = owner_id if n_owner_match > majority else None
@@ -717,17 +760,13 @@ def verify_video(
 
     frame_tamper_rate = n_tampered_frames / max(len(per_frame), 1)
 
-    # Video tamper rule (user spec): "if the block is tampered or there is
-    # frame changed, then it is tampered".  Any frame with content_tampered
-    # (block flagged) or chain_break (frame_id mismatch) or identity_mismatch
-    # marks the whole video as tampered.
-    explicit_tamper = bool(
-        n_explicit_frame_mismatch
-        or n_explicit_chain_mismatch
-        or n_explicit_owner_mismatch
-        or n_explicit_media_mismatch
-    )
-    tampered = explicit_tamper or n_tampered_frames > 0 or truncated
+    # Video tamper rule: a frame's own content/identity/chain broke, OR the
+    # temporal sequence was altered (deletion / reorder / replay / truncation).
+    # Crucially, deleting one frame flags only the missing id — the surviving
+    # frames stay authentic.
+    content_or_id_tamper = bool(n_content_tampered or n_id_mismatch or n_self_chain_bad)
+    temporal_tamper      = bool(missing_frame_ids or reordered or duplicate_frame_ids or truncated)
+    tampered             = content_or_id_tamper or temporal_tamper
 
     return {
         "video_path":                  video_path,
@@ -737,13 +776,19 @@ def verify_video(
         "owner_match_frames":          n_owner_match,
         "media_match_frames":          n_media_match,
         "frames_tampered":             n_tampered_frames,
-        "frames_chain_break":          n_chain_breaks,
+        # Per-frame chain breaks now mean "this frame's own chain is bad", not
+        # the old index-shift cascade.  Kept under the same response key.
+        "frames_chain_break":          n_self_chain_bad,
         "frames_content_tampered":     n_content_tampered,
         "frames_id_mismatch":          n_id_mismatch,
-        "frames_explicit_frame_mismatch": n_explicit_frame_mismatch,
-        "frames_explicit_chain_mismatch": n_explicit_chain_mismatch,
-        "frames_explicit_owner_mismatch": n_explicit_owner_mismatch,
-        "frames_explicit_media_mismatch": n_explicit_media_mismatch,
+        # Temporal localization (the headline fix): which frame_ids went
+        # missing / got reordered / duplicated, derived from the id sequence.
+        "missing_frame_ids":           missing_frame_ids,
+        "missing_frame_patterns":      missing_frame_patterns,
+        "frames_deleted":              len(missing_frame_ids),
+        "reordered":                   reordered,
+        "reorder_at":                  reorder_at,
+        "duplicate_frame_ids":         duplicate_frame_ids,
         "observed_total_frames":       observed_total_frames,
         "expected_total_frames":       expected_total_frames,
         "frames_truncated":            frames_truncated,
