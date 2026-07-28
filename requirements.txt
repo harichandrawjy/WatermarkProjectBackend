@@ -11,3 +11,6 @@ galois>=0.3
 supabase>=2.0
 python-dotenv>=1.0
 pydantic[email]>=2.0
+# Imported directly by main.py for the stateless password-reset call. Already a
+# transitive dependency of supabase, but pinned here because we import it.
+httpx>=0.24

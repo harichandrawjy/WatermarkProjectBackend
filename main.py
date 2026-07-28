@@ -19,6 +19,7 @@ import io
 import uuid
 import json
 import base64
+import secrets
 from pathlib import Path
 from typing import Any
 
@@ -50,7 +51,9 @@ from watermark_engine import (
 )
 from video_watermark import embed_video, verify_video
 
-from db import supabase, supabase_auth
+import httpx
+
+from db import supabase, supabase_auth, SUPABASE_URL, SUPABASE_ANON_KEY
 
 # ── Storage layout ──
 STORAGE_DIR = Path(__file__).resolve().parent / "storage"
@@ -272,6 +275,108 @@ def auth_me(user: dict = Depends(get_current_user)):
     return {"id": user["id"], "email": user["email"]}
 
 
+class ForgotBody(BaseModel):
+    email: EmailStr
+
+
+@app.post("/auth/forgot-password")
+def auth_forgot_password(body: ForgotBody):
+    """Send a password-recovery email.
+
+    Supabase mails a link to `<SITE_URL>/#access_token=...&type=recovery`; the
+    frontend picks that hash up and shows the "set a new password" form.
+
+    Always reports success — even for an address with no account, and even if
+    Supabase itself errors.  Reporting "no such user" would turn this endpoint
+    into an account-enumeration oracle: anyone could probe which emails are
+    registered.  That matters here because /lookup already exposes owner
+    identities publicly, so confirming an address exists is a real leak.
+    """
+    site_url = os.getenv("SITE_URL", "http://localhost:5173")
+    try:
+        supabase_auth.auth.reset_password_email(
+            body.email, {"redirect_to": site_url}
+        )
+    except Exception as e:
+        # Logged, never returned — the caller must not be able to tell the
+        # difference between "sent" and "no such account".
+        print(f"[forgot-password] suppressed for {body.email!r}: {e}")
+
+    return {
+        "sent": True,
+        "message": "If that email has an account, a reset link is on its way.",
+    }
+
+
+class ResetBody(BaseModel):
+    access_token: str
+    new_password: str
+
+
+@app.post("/auth/reset-password")
+def auth_reset_password(body: ResetBody):
+    """Set a new password using the recovery token from the emailed link.
+
+    Calls GoTrue's REST endpoint directly rather than
+    `supabase_auth.auth.update_user()`, which would act on the shared global
+    client's stored session.  That client is process-wide, so a concurrent
+    request could have swapped the session underneath us — an acceptable risk
+    almost nowhere, and certainly not when changing a password.  Passing the
+    recovery token as an explicit Bearer header keeps the operation stateless
+    and unambiguous about whose password is being changed.
+    """
+    token = body.access_token.strip()
+    if not token:
+        raise HTTPException(400, "Missing recovery token")
+    if not body.new_password:
+        raise HTTPException(400, "New password is required")
+
+    try:
+        res = httpx.put(
+            f"{SUPABASE_URL}/auth/v1/user",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "apikey":        SUPABASE_ANON_KEY,
+                "Content-Type":  "application/json",
+            },
+            json={"password": body.new_password},
+            timeout=15,
+        )
+    except Exception as e:
+        raise HTTPException(503, f"Could not reach the auth service: {e}")
+
+    if res.status_code >= 400:
+        # Surface Supabase's own wording — it owns the password policy, so it
+        # is the only thing that knows why a password was rejected (too short,
+        # previously used, link expired, ...).  Duplicating those rules here
+        # would just create a second source of truth that drifts.
+        detail = ""
+        try:
+            j = res.json()
+            detail = j.get("msg") or j.get("message") or j.get("error_description") or ""
+        except Exception:
+            detail = res.text[:200]
+        if res.status_code in (401, 403):
+            raise HTTPException(
+                401,
+                detail or "This reset link has expired or was already used. "
+                          "Request a new one.",
+            )
+        if res.status_code >= 500:
+            # Upstream is down (Supabase returns Cloudflare 5xx when the auth
+            # origin is unreachable).  Reporting that as a 400 would blame the
+            # user's input for an outage and send them re-requesting links
+            # that were never going to work.
+            raise HTTPException(
+                503,
+                "The authentication service is temporarily unavailable. "
+                "Please try again in a few minutes.",
+            )
+        raise HTTPException(400, detail or f"Could not update password ({res.status_code})")
+
+    return {"ok": True}
+
+
 # ──────────────────────────────────────────────────────────────
 # Encode / verify / lookup
 # ──────────────────────────────────────────────────────────────
@@ -284,27 +389,99 @@ def _id_key(s: str, n_bytes: int) -> str:
     return _decode_id_fixed(_encode_id_fixed(s, n_bytes)).lower()
 
 
+# Look-alike characters (i/l/1, o/0) are excluded so a short_id can be read
+# aloud or retyped without ambiguity.
+_SHORT_ID_ALPHABET = "abcdefghjkmnpqrstuvwxyz23456789"
+_SHORT_ID_LEN      = OWNER_ID_BYTES          # 8 — fills the embed slot exactly
+
+
+def _new_short_id() -> str:
+    return "".join(secrets.choice(_SHORT_ID_ALPHABET) for _ in range(_SHORT_ID_LEN))
+
+
+def _get_or_create_short_id(user: dict) -> str:
+    """The 8-character identifier actually embedded in this user's watermarks.
+
+    The engine truncates the owner string to OWNER_ID_BYTES (8), so embedding
+    an email would collapse every account sharing its first 8 characters into a
+    single owner — `john.smith@gmail.com` and `john.smigielski@x.com` both
+    become `john.smi`.  Widening the field isn't possible (at 512x512 a 12-byte
+    owner id leaves no room for the majority-vote repetition copies), so the
+    fix is to make those 8 bytes an ASSIGNED value rather than a DERIVED one:
+    short_ids carry a UNIQUE constraint, arbitrary email prefixes cannot.
+
+    Allocated lazily on first encode and stable forever after — it is baked
+    into every file the user has already distributed.
+    """
+    res = (
+        supabase.table("profiles")
+        .select("short_id")
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if res.data:
+        return res.data[0]["short_id"]
+
+    # Retry on short_id collision.  The alphabet gives 31^8 ~= 8.5e11 values,
+    # so a retry is rare — but the UNIQUE constraint, not luck, is what makes
+    # uniqueness actual rather than probable.
+    for _ in range(5):
+        sid = _new_short_id()
+        try:
+            supabase.table("profiles").insert({
+                "user_id": user["id"],
+                "short_id": sid,
+                "email":    user["email"],
+            }).execute()
+            return sid
+        except Exception:
+            # Either short_id collided (retry with a new one) or a concurrent
+            # request already created this user's row (re-read and use theirs).
+            res = (
+                supabase.table("profiles")
+                .select("short_id")
+                .eq("user_id", user["id"])
+                .limit(1)
+                .execute()
+            )
+            if res.data:
+                return res.data[0]["short_id"]
+
+    raise HTTPException(500, "Could not allocate a watermark ID — please retry.")
+
+
 @app.post("/encode")
 async def encode(
     file:     UploadFile = File(...),
     media_id: str        = Form(...),
     user:     dict       = Depends(get_current_user),
 ):
-    # Owner is derived from the authenticated user — no longer free-text.
-    # The watermark engine truncates to OWNER_ID_BYTES (8), but the DB
-    # keeps the full email so /lookup still works after compression.
-    owner = user["email"]
+    # Two different strings, deliberately:
+    #   owner_email — the human-readable account, kept in the DB and returned
+    #                 by /lookup.  Never embedded.
+    #   owner       — the assigned 8-char short_id that IS embedded.  Using the
+    #                 email here would truncate to its first 8 bytes and merge
+    #                 distinct accounts into one owner (see migration 003).
+    owner_email = user["email"]
+    owner       = _get_or_create_short_id(user)
 
     # Uniqueness guard: an owner cannot reuse a media_id whose embedded 8-byte
     # key collides with one they already have — otherwise blind /lookup could
     # resolve to the wrong record.  Checked BEFORE embedding so we don't waste
     # work or leave an orphan file; the DB unique index is the race-proof
     # backstop (see migration 002).
+    #
+    # Scoped to user_id as well as owner_key: short_ids make owner_key unique
+    # per account already, but legacy rows still hold email-prefix keys that
+    # two accounts can share — without this filter such a row would block a
+    # different user and quote THEIR media_id back in the error below.
     owner_key = _id_key(owner,    OWNER_ID_BYTES)
     media_key = _id_key(media_id, MEDIA_ID_BYTES)
     dup = (
         supabase.table("watermarks")
         .select("id, media")
+        .eq("user_id", user["id"])
         .eq("owner_key", owner_key)
         .eq("media_key", media_key)
         .limit(1)
@@ -336,11 +513,23 @@ async def encode(
         out_path = OUTPUT_DIR / f"{file_id}_wm.mkv"
         meta     = embed_video(str(in_path), str(out_path), owner, media_id)
 
+    # The original upload has served its purpose — embedding (and, for video,
+    # the audio mux) is finished.  Drop it now rather than leaving user media
+    # sitting in storage/uploads forever.  out_path is deliberately KEPT: it is
+    # the watermarked file served at /files/<name> and re-downloaded from the
+    # Dashboard.
+    in_path.unlink(missing_ok=True)
+
     meta_jsonable = _to_jsonable(meta)
+    # The engine records owner_id = the embedded short_id.  Carry the readable
+    # address alongside it so the Verify/Results UI can name the owner from a
+    # metadata sidecar alone, without a /lookup round-trip.
+    meta_jsonable["owner_email"] = owner_email
+
     try:
         supabase.table("watermarks").insert({
             "id":        file_id,
-            "owner":     owner,
+            "owner":     owner_email,
             "media":     media_id,
             "owner_key": owner_key,
             "media_key": media_key,
@@ -519,10 +708,16 @@ async def lookup(file: UploadFile = File(...)):
     owner_id = parsed["owner_id"]
     media_id = parsed["media_id"]
 
-    # Match on the exact embedded 8-byte key (lowercased), which is unique per
-    # owner (migration 002).  This is what the watermark actually carries, so
-    # resolution is unambiguous — no prefix over-matching where one id is a
-    # prefix of another.  The full owner/media strings are returned from the row.
+    # Match on the exact embedded 8-byte key (lowercased), unique per owner via
+    # the index from migration 002.  This is what the watermark actually
+    # carries, so resolution is unambiguous — no prefix over-matching where one
+    # id is a prefix of another.  The readable owner/media strings come back
+    # from the row itself.
+    #
+    # For files encoded after migration 003 the owner key is an assigned
+    # short_id, so it identifies exactly one account.  Files encoded before it
+    # carry an email prefix and remain resolvable through their original row —
+    # which is why 003 does not rewrite historic owner_keys.
     owner_key = owner_id.lower()
     media_key = media_id.lower()
     res = (
@@ -562,19 +757,26 @@ async def verify(
 
     in_path.write_bytes(await file.read())
 
+    # `finally` so the upload is removed on the error paths too — a bad
+    # metadata JSON or an unreadable file must not leave media behind.  The
+    # Verify page tells users their upload is deleted once the report is
+    # generated; this is what makes that true.
     try:
-        meta = json.loads(metadata)
-    except json.JSONDecodeError as e:
-        raise HTTPException(400, f"Invalid metadata JSON: {e}")
+        try:
+            meta = json.loads(metadata)
+        except json.JSONDecodeError as e:
+            raise HTTPException(400, f"Invalid metadata JSON: {e}")
 
-    if kind == "image":
-        img        = np.array(Image.open(in_path).convert("RGB"))
-        img_h, img_w = img.shape[:2]
-        verdict    = verify_image(img, meta)
-        return _shape_image_response(verdict, file.filename, img_w, img_h)
-    else:
-        verdict = verify_video(str(in_path), meta, sample_frames=None)
-        return _shape_video_response(verdict, file.filename)
+        if kind == "image":
+            img        = np.array(Image.open(in_path).convert("RGB"))
+            img_h, img_w = img.shape[:2]
+            verdict    = verify_image(img, meta)
+            return _shape_image_response(verdict, file.filename, img_w, img_h)
+        else:
+            verdict = verify_video(str(in_path), meta, sample_frames=None)
+            return _shape_video_response(verdict, file.filename)
+    finally:
+        in_path.unlink(missing_ok=True)
 
 
 def _shape_image_response(v: dict, filename: str, width: int, height: int) -> dict:
@@ -596,6 +798,12 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int) -> di
         "mediaMatch":      bool(v["media_match"]),
         "owner":           v.get("owner"),
         "media":           v.get("media"),
+        # The RAW strings pulled out of the pixels — present even on a
+        # mismatch, which is exactly when they matter: the UI can show
+        # "expected 7nnzgbne, extracted 7nnzg8ne" instead of echoing back the
+        # expected value with a "Mismatch" badge stuck on it.
+        "ownerId":         v.get("owner_id_recovered"),
+        "mediaId":         v.get("media_id_recovered"),
         "blocksTampered":  int(v["n_blocks_tampered"]),
         "blocksTotal":     int(v["n_blocks_total"]),
         # Fragile-watermark comparison images (PNG data URLs): the expected
@@ -665,6 +873,21 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         video_h = int(Hb * SPATIAL_BLOCK)
         video_w = int(Wb * SPATIAL_BLOCK)
 
+    # Identity fields — previously omitted entirely for video, which left the
+    # Results page with no Match/Mismatch badges and forced it to guess whether
+    # a watermark had been found at all.  Derived from the per-frame results:
+    # a frame's recovered id is the majority value across every frame that
+    # recovered one.
+    def _modal(key: str):
+        vals = [r.get(key) for r in per_frame if r.get(key)]
+        return max(set(vals), key=vals.count) if vals else None
+
+    owner_recovered = _modal("owner_id_recovered")
+    media_recovered = _modal("media_id_recovered")
+    n_checked       = max(len(per_frame), 1)
+    owner_match_all = v.get("owner_match_frames", 0) > n_checked / 2
+    media_match_all = v.get("media_match_frames", 0) > n_checked / 2
+
     return {
         "status":          "tampered" if v["TAMPERED"] else "authentic",
         "confidence":      max(0.0, min(1.0, 1.0 - float(v.get("frame_tamper_rate", 0.0)))),
@@ -673,6 +896,13 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         "fileType":        "video",
         "fileName":        filename,
         "tamperedRegions": [],
+        "watermarkFound":  bool(owner_recovered or media_recovered),
+        "ownerMatch":      bool(owner_match_all),
+        "mediaMatch":      bool(media_match_all),
+        "owner":           v.get("owner"),
+        "media":           v.get("media"),
+        "ownerId":         owner_recovered,
+        "mediaId":         media_recovered,
         "frameResults":    frame_results,
         "imageWidth":      video_w,
         "imageHeight":     video_h,

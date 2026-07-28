@@ -24,11 +24,19 @@ Never expose `SUPABASE_SERVICE_KEY` to the frontend — it bypasses Row Level Se
 
 Optional: `ALLOWED_ORIGINS` (comma-separated) to allowlist extra origins for CORS (e.g. a Vercel deployment URL).
 
+Optional: `SITE_URL` — where password-recovery emails send the user back to. Defaults to `http://localhost:5173`. Set this to your deployed frontend URL in production, **and** add the same URL under Supabase Dashboard → Authentication → URL Configuration → Redirect URLs, or Supabase will refuse to redirect there and the reset link will fail.
+
 The watermark engine in `engine/` is imported directly via `sys.path` — no `pip install`.
 
 ## Database
 
-Run the SQL in [`migrations/001_add_user_id.sql`](migrations/001_add_user_id.sql) once via Supabase Dashboard → SQL Editor. It adds `user_id UUID` and a `created_at` default to the `watermarks` table so per-user isolation and history sorting work.
+Run the migrations once each, in order, via Supabase Dashboard → SQL Editor:
+
+1. [`migrations/001_add_user_id.sql`](migrations/001_add_user_id.sql) — adds `user_id UUID` and a `created_at` default to the `watermarks` table so per-user isolation and history sorting work.
+2. [`migrations/002_add_watermark_keys.sql`](migrations/002_add_watermark_keys.sql) — adds `owner_key` / `media_key` (the byte-truncated, lowercased form of `owner` / `media` that the watermark actually carries), backfills them for existing rows, and adds the `UNIQUE (owner_key, media_key)` index that `/encode` relies on as its race-proof collision backstop.
+3. [`migrations/003_add_profiles_short_id.sql`](migrations/003_add_profiles_short_id.sql) — adds a `profiles` table holding each account's assigned 8-character `short_id`, which is what now gets embedded as the watermark's owner.
+
+All three are idempotent — re-running them is safe. `/encode` and `/lookup` both fail without 002, since they read and write `owner_key` / `media_key` directly; `/encode` fails without 003, since it allocates a `short_id` per user.
 
 ## Run
 
@@ -48,6 +56,14 @@ Open <http://localhost:8000/> to see the service info JSON.
 | POST | `/auth/login` | `{ email, password }` | `{ user, access_token, refresh_token }` |
 | POST | `/auth/refresh` | `{ refresh_token }` | Fresh token pair — called by the frontend on 401 |
 | GET  | `/auth/me` | Bearer | `{ id, email }` |
+| POST | `/auth/forgot-password` | `{ email }` | `{ sent: true, message }` — **always**, see below |
+| POST | `/auth/reset-password` | `{ access_token, new_password }` | `{ ok: true }` |
+
+`/auth/forgot-password` reports success for every address, including ones with no account and even when Supabase itself errors. Returning "no such user" would make the endpoint an account-enumeration oracle — anyone could probe which emails are registered. That matters here because `/lookup` already exposes owner identities publicly.
+
+`/auth/reset-password` calls GoTrue's REST API directly with the recovery token as a Bearer header rather than using `supabase_auth.auth.update_user()`, which acts on the process-wide client's stored session. A concurrent request could swap that session underneath the call — unacceptable when changing a password. The direct call is stateless and unambiguous about whose password changes.
+
+Supabase's built-in email sender is rate-limited to a handful of messages per hour on the free tier and often lands in spam. Configure custom SMTP (Dashboard → Project Settings → Auth → SMTP) before relying on password reset or email confirmation in a demo.
 
 ### Encode / verify / lookup
 
@@ -61,7 +77,18 @@ Open <http://localhost:8000/> to see the service info JSON.
 | GET | `/me/media` | Bearer | — | `{ items: WatermarkRow[] }` — the user's own encodes, newest first |
 | GET | `/me/media/{id}/metadata` | Bearer | — | Metadata JSON for that record (scoped to the caller) |
 
-`owner` on `/encode` is **not** a form field — it's derived from the JWT's email so it can't be spoofed. The engine truncates the owner string to `OWNER_ID_BYTES = 8` when embedding bits; the full email is kept in the DB so `/lookup` still works after compression.
+`owner` on `/encode` is **not** a form field — it's tied to the caller's JWT so it can't be spoofed.
+
+Two distinct values are involved, and the difference matters:
+
+| | what it is | where it lives |
+|---|---|---|
+| `owner` | the account's full email | `watermarks.owner`, returned by `/lookup` — **never embedded** |
+| `short_id` | an assigned 8-char tag | `profiles.short_id`, copied to `watermarks.owner_key` — **this is what goes into the pixels** |
+
+The engine's owner slot is `OWNER_ID_BYTES = 8`, so embedding the email directly would truncate it to the first 8 characters and merge every account sharing that prefix into one owner (`john.smith@gmail.com` and `john.smigielski@x.com` both become `john.smi`). Widening the slot isn't viable — at 512×512 the LL-family capacity is 768 bits, and a 12-byte owner id leaves zero room for the majority-vote repetition copies. So the 8 bytes now hold an **assigned** identifier (unique by constraint) instead of a **derived** prefix (unique by luck).
+
+`/lookup` matches on `owner_key` and returns the row's full email, so the user-facing output is unchanged.
 
 ## Storage
 
