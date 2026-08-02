@@ -386,10 +386,10 @@ def _extract_bits_dct_svd_with_mask(
 # ──────────────────────────────────────────────────────────────
 # LSB-BASED SPATIAL LOCALISATION  (compression-tolerant layer)
 # ──────────────────────────────────────────────────────────────
-# Encodes a target parity bit in the LSB of each 4×4 sub-block's mean
-# (block-mean QIM with step Q=2).  Aggregated to the same 32×32 spatial
-# grid as the DCT/SVD fingerprint map, so the two maps can be ANDed for
-# compression-robust tamper localisation.
+# Encodes a target parity bit in the LSB of each 16×16 sub-block's mean
+# (block-mean QIM with step Q=2, see LSB_SUB_BLOCK_SIZE).  Aggregated to the
+# same 32×32 spatial grid as the DCT/SVD fingerprint map, so the two maps can
+# be ANDed for compression-robust tamper localisation.
 
 def _compute_lsb_target_pattern(
     n_sub_h: int,
@@ -399,7 +399,7 @@ def _compute_lsb_target_pattern(
 ) -> np.ndarray:
     """Pseudo-random target LSB grid keyed by (signature, frame_id).
 
-    Same shape as the 4×4 sub-block grid.  Both encoder and decoder
+    Same shape as the 16×16 sub-block grid.  Both encoder and decoder
     derive identical bits from public inputs — no key material.
     """
     n_total = n_sub_h * n_sub_w
@@ -424,12 +424,15 @@ def _embed_lsb_sub_block_parity(
     sub_block: int = LSB_SUB_BLOCK_SIZE,
     q: float = LSB_QIM_STEP,
 ) -> np.ndarray:
-    """Adjust Y so each 4×4 sub-block's mean encodes the target LSB parity.
+    """Adjust Y so each 16×16 sub-block's mean encodes the target LSB parity.
 
     Per sub-block: shift the mean to the nearest multiple of q whose
     parity matches the target bit.  The shift is applied uniformly to
-    all 16 pixels of the sub-block, so each pixel moves by at most q/2.
+    all 256 pixels of the sub-block, so each pixel moves by at most q/2.
     With q=2 this is ≤1 grey-level → ≥48 dB local PSNR.
+
+    `sub_block` defaults to LSB_SUB_BLOCK_SIZE; the sizes quoted above follow
+    from that constant rather than being independent facts.
     """
     Y_out = Y.copy().astype(np.float64)
     n_sub_h, n_sub_w = target_pattern.shape
@@ -484,12 +487,18 @@ def _aggregate_lsb_to_block_map(
     """Down-sample the sub-block mismatch grid to the 32×32 spatial-block grid.
 
     A spatial block is flagged when more than `ratio_threshold` of its
-    (spatial_block/sub_block)² = 64 sub-bits disagree with their target.
-    Compression noise produces ~5% disagreements (well below 30%); real
-    tampering of a block produces ~50% (well above 30%) — so this single
-    threshold cleanly separates the two regimes.
+    (spatial_block/sub_block)² = (32/16)² = 4 sub-cells disagree with their
+    target — i.e. at 45%, when 2 of the 4 disagree.
+
+    Compression noise leaves most blocks at 0 of 4; a real edit flips most of
+    the cells it covers.  The gap between those regimes is what the 45%
+    threshold separates.  Because only 4 cells feed each decision, this layer
+    is deliberately coarse on its own — MIN_TAMPER_BLOCKS supplies the second
+    stage, requiring a cluster of flagged blocks before anything is called
+    tampering.  See LSB_BLOCK_TAMPER_RATIO and MIN_TAMPER_BLOCKS for how both
+    values were tuned.
     """
-    sub_per_block = spatial_block // sub_block               # 32/4 = 8
+    sub_per_block = spatial_block // sub_block               # 32/16 = 2
     n_sub_h, n_sub_w = sub_mismatch.shape
     n_bh = n_sub_h // sub_per_block
     n_bw = n_sub_w // sub_per_block

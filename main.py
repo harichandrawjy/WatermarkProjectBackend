@@ -781,12 +781,46 @@ async def verify(
         in_path.unlink(missing_ok=True)
 
 
+def _tamper_reasons(v: dict) -> list:
+    """Why a verdict came out `tampered`, in the user's words.
+
+    The verdict is a single boolean OR'd from unrelated signals, so on its own
+    it can't say whether the file was edited, re-encoded past recovery, or had
+    frames removed.  Previously the UI compensated with a "confidence" score
+    that measured cleanliness — which inverts on a tampered verdict and could
+    read "TAMPERED — 100% confidence".  Naming the actual trigger is both
+    truthful and more useful than any percentage.
+    """
+    reasons = []
+    if v.get("content_tampered"):
+        n = int(v.get("n_blocks_tampered", 0))
+        reasons.append(f"{n} image region{'s' if n != 1 else ''} were modified")
+    if not v.get("owner_match"):
+        reasons.append("the owner ID could not be matched")
+    if not v.get("media_match"):
+        reasons.append("the media ID could not be matched")
+    if v.get("frame_match") is False and v.get("frame_recovery") != "none":
+        reasons.append("the frame number did not match")
+    if v.get("chain_match") is False and v.get("chain_recovery") != "none":
+        reasons.append("the chain tag did not match")
+    return reasons
+
+
 def _shape_image_response(v: dict, filename: str, width: int, height: int) -> dict:
+    # A genuine bit error rate: the fraction of fragile-watermark parity bits
+    # that flipped.  The old `ber` was `spatial.mean()` — the fraction of
+    # flagged 32x32 BLOCKS — which is a localisation ratio, not a bit rate, and
+    # was mislabelled "Bit Error Rate" in the UI.  Both are reported now, each
+    # under its own name.
+    ber_bits = float(v.get("ber_lsb_sub", v.get("ber", 0.0)))
     return {
         "status":          "tampered" if v["tampered"] else "authentic",
-        "confidence":      max(0.0, min(1.0, 1.0 - float(v["ber"]))),
-        "wmAccuracy":      max(0.0, min(1.0, 1.0 - float(v["ber"]))),
-        "ber":             float(v["ber"]),
+        # Measured, not synthesised: what fraction of the fragile watermark's
+        # bits survived. No "confidence" score — see _tamper_reasons.
+        "wmAccuracy":      max(0.0, min(1.0, 1.0 - ber_bits)),
+        "ber":             ber_bits,
+        "blockFlagRatio":  float(v["ber"]),
+        "reasons":         _tamper_reasons(v) if v["tampered"] else [],
         "fileType":        "image",
         "fileName":        filename,
         "imageWidth":      int(width),
@@ -840,10 +874,16 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         # fall back to playback position when it couldn't be recovered.
         rec_fid = pf.get("rec_fid")
         true_frame_idx = rec_fid if rec_fid is not None else pf.get("frame_idx", i)
+        # Per-frame numbers are measured, not assigned.  This used to be
+        # `0.5 if t else 0.95` — two invented constants surfaced to the user as
+        # a percentage.  `ber` here is the frame's real fragile-layer bit error
+        # rate; `blocksTampered` is how much of it was flagged.
         frame_results.append({
             "frame":           int(true_frame_idx),
             "status":          "tampered" if t else "authentic",
-            "confidence":      0.5 if t else 0.95,
+            "ber":             float(pf.get("ber_lsb_sub", 0.0)),
+            "blocksTampered":  int(pf.get("n_blocks_tampered", 0)),
+            "blocksTotal":     int(pf.get("n_blocks_total", 0)),
             "tamperedRegions": _spatial_to_regions(per_frame_map),
             # Per-frame fragile-watermark comparison (present for every frame
             # so the user can inspect whichever frame they select).
@@ -860,7 +900,9 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         frame_results.append({
             "frame":              int(mp["frame_id"]),
             "status":             "deleted",
-            "confidence":         0.0,
+            "ber":                None,   # nothing to measure — the frame is gone
+            "blocksTampered":     0,
+            "blocksTotal":        0,
             "tamperedRegions":    [],
             "watermarkOriginal":  _pattern_to_data_url(mp.get("target_pattern")),
             "watermarkExtracted": None,   # nothing to extract — the frame is gone
@@ -890,11 +932,42 @@ def _shape_video_response(v: dict, filename: str) -> dict:
     owner_match_all = v.get("owner_match_frames", 0) > n_checked / 2
     media_match_all = v.get("media_match_frames", 0) > n_checked / 2
 
+    # Same treatment as the image path: a real bit error rate (mean fragile-layer
+    # BER across verified frames) rather than the block-flag ratio that used to
+    # be reported under that name.
+    per_frame_bers = [float(r.get("ber_lsb_sub", 0.0)) for r in per_frame]
+    ber_bits = float(sum(per_frame_bers) / len(per_frame_bers)) if per_frame_bers else 0.0
+
+    # Why the clip was flagged. Temporal edits are the case the old "confidence"
+    # number handled worst: deleting a frame leaves every survivor authentic, so
+    # frame_tamper_rate stayed 0 and the UI announced "TAMPERED — 100%".
+    reasons = []
+    n_content = int(v.get("frames_content_tampered", 0))
+    if n_content:
+        reasons.append(f"{n_content} frame{'s' if n_content != 1 else ''} had modified regions")
+    n_ident = int(v.get("frames_id_mismatch", 0))
+    if n_ident:
+        reasons.append(f"{n_ident} frame{'s' if n_ident != 1 else ''} failed the identity check")
+    n_chain = int(v.get("frames_chain_break", 0))
+    if n_chain:
+        reasons.append(f"{n_chain} frame{'s' if n_chain != 1 else ''} had an inconsistent chain tag")
+    n_del = len(v.get("missing_frame_ids", []) or [])
+    if n_del:
+        reasons.append(f"{n_del} frame{'s' if n_del != 1 else ''} deleted")
+    if v.get("reordered"):
+        reasons.append("frames were reordered")
+    n_dup = len(v.get("duplicate_frame_ids", []) or [])
+    if n_dup:
+        reasons.append(f"{n_dup} frame{'s' if n_dup != 1 else ''} duplicated")
+    if int(v.get("frames_truncated", 0)) > 2:
+        reasons.append(f"{int(v['frames_truncated'])} frames truncated from the end")
+
     return {
         "status":          "tampered" if v["TAMPERED"] else "authentic",
-        "confidence":      max(0.0, min(1.0, 1.0 - float(v.get("frame_tamper_rate", 0.0)))),
-        "wmAccuracy":      max(0.0, min(1.0, 1.0 - float(v["average_ber"]))),
-        "ber":             float(v["average_ber"]),
+        "wmAccuracy":      max(0.0, min(1.0, 1.0 - ber_bits)),
+        "ber":             ber_bits,
+        "blockFlagRatio":  float(v["average_ber"]),
+        "reasons":         reasons if v["TAMPERED"] else [],
         "fileType":        "video",
         "fileName":        filename,
         "tamperedRegions": [],
