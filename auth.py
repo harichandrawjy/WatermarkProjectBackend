@@ -38,3 +38,23 @@ def get_current_user(authorization: str | None = Header(None)) -> dict:
         "email": user.email or "",
         "token": token,
     }
+
+
+def get_optional_user(authorization: str | None = Header(None)) -> dict | None:
+    """Like `get_current_user`, but returns None instead of raising.
+
+    For endpoints that are public by design yet want to recognise a caller when
+    one is present.  /verify is the case this exists for: anyone holding the
+    metadata can verify a file, with or without an account — but when they are
+    signed in we record the run to their verification history.
+
+    A bad or expired token is treated as "not signed in" rather than an error,
+    so a stale token in localStorage can never break verification for someone
+    who did not need to be signed in anyway.
+    """
+    if not authorization or not authorization.lower().startswith("bearer "):
+        return None
+    try:
+        return get_current_user(authorization)
+    except Exception:
+        return None

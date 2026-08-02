@@ -31,7 +31,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 
-from auth import get_current_user
+from auth import get_current_user, get_optional_user
 
 ENGINE_DIR = (Path(__file__).resolve().parent / "engine").resolve()
 if not ENGINE_DIR.exists():
@@ -747,10 +747,82 @@ async def lookup(file: UploadFile = File(...)):
     }
 
 
+def _record_verification(user: dict | None, resp: dict, meta: dict, kind: str) -> None:
+    """Append this run to the caller's verification history.
+
+    Best-effort and deliberately silent: /verify works without an account and
+    without the database, and adding history must not introduce a new way for
+    it to fail.  A logging problem should never cost the user their report, so
+    every error here is swallowed.
+
+    No-op for anonymous callers — /verify is public, so there is frequently no
+    one to attribute the run to.
+    """
+    if not user:
+        return
+    try:
+        claimed_owner = meta.get("owner_id")
+        claimed_media = meta.get("media_id")
+
+        # Best-effort link back to the encode record, via the same 8-byte keys
+        # /lookup matches on.  Nullable by design: users can verify files they
+        # never encoded.
+        watermark_id = None
+        if claimed_owner and claimed_media:
+            try:
+                hit = (
+                    supabase.table("watermarks")
+                    .select("id")
+                    .eq("owner_key", _id_key(str(claimed_owner), OWNER_ID_BYTES))
+                    .eq("media_key", _id_key(str(claimed_media), MEDIA_ID_BYTES))
+                    .limit(1)
+                    .execute()
+                )
+                if hit.data:
+                    watermark_id = hit.data[0]["id"]
+            except Exception:
+                pass
+
+        supabase.table("verifications").insert({
+            "id":               uuid.uuid4().hex[:12],
+            "user_id":          user["id"],
+            "file_name":        resp.get("fileName"),
+            "kind":             kind,
+            "status":           resp.get("status"),
+            "reasons":          resp.get("reasons") or [],
+            "ber":              resp.get("ber"),
+            "wm_accuracy":      resp.get("wmAccuracy"),
+            "block_flag_ratio": resp.get("blockFlagRatio"),
+            "blocks_tampered":  resp.get("blocksTampered"),
+            "blocks_total":     resp.get("blocksTotal"),
+            "claimed_owner":    meta.get("owner_email") or claimed_owner,
+            "claimed_media":    claimed_media,
+            "recovered_owner":  resp.get("ownerId"),
+            "recovered_media":  resp.get("mediaId"),
+            "watermark_id":     watermark_id,
+        }).execute()
+    except Exception as e:
+        print(f"[verify] history not recorded: {e}")
+
+
+@app.get("/me/verifications")
+def list_my_verifications(user: dict = Depends(get_current_user)):
+    res = (
+        supabase.table("verifications")
+        .select("*")
+        .eq("user_id", user["id"])
+        .order("created_at", desc=True)
+        .limit(100)
+        .execute()
+    )
+    return {"items": res.data or []}
+
+
 @app.post("/verify")
 async def verify(
     file:     UploadFile = File(...),
     metadata: str        = Form(...),
+    user:     dict | None = Depends(get_optional_user),
 ):
     kind    = _detect_kind(file.filename)
     file_id = uuid.uuid4().hex[:12]
@@ -773,10 +845,13 @@ async def verify(
             img        = np.array(Image.open(in_path).convert("RGB"))
             img_h, img_w = img.shape[:2]
             verdict    = verify_image(img, meta)
-            return _shape_image_response(verdict, file.filename, img_w, img_h)
+            resp       = _shape_image_response(verdict, file.filename, img_w, img_h)
         else:
             verdict = verify_video(str(in_path), meta, sample_frames=None)
-            return _shape_video_response(verdict, file.filename)
+            resp    = _shape_video_response(verdict, file.filename)
+
+        _record_verification(user, resp, meta, kind)
+        return resp
     finally:
         in_path.unlink(missing_ok=True)
 
