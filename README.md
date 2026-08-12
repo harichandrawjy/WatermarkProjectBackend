@@ -76,6 +76,7 @@ Supabase's built-in email sender is rate-limited to a handful of messages per ho
 | GET | `/files/{name}` | — | — | The watermarked output file (served via StaticFiles) |
 | GET | `/me/media` | Bearer | — | `{ items: WatermarkRow[] }` — the user's own encodes, newest first |
 | GET | `/me/media/{id}/metadata` | Bearer | — | Metadata JSON for that record (scoped to the caller) |
+| DELETE | `/me/media/{id}` | Bearer | — | Deletes the record, freeing its `media_id` for reuse |
 
 `owner` on `/encode` is **not** a form field — it's tied to the caller's JWT so it can't be spoofed.
 
@@ -92,12 +93,34 @@ The engine's owner slot is `OWNER_ID_BYTES = 8`, so embedding the email directly
 
 ## Storage
 
-Files land in `./storage/`:
+**No user media is retained.** The server keeps metadata; it does not keep files.
 
-- `uploads/` — incoming uploads
-- `outputs/` — watermarked files (served at `/files/<name>`)
+- `uploads/` — deleted as soon as the request finishes, including on error paths
+- `outputs/` — written so the encode response can serve a preview and a download, then left to the host's disk lifecycle. **No retention is promised.**
 
-Metadata JSONs live in Postgres (`watermarks.metadata`), not on disk. For production, swap the local `storage/` for S3/MinIO.
+This is a design decision, not a limitation to work around. Encoding is
+**deterministic**: the same original + owner + `media_id` produces a
+byte-identical file every time, because the signature, chain tag and QIM
+lattice all derive from those inputs via SHA-256. The watermarked file is
+therefore a pure function of things the user already has, and it is handed to
+them at encode time. What genuinely cannot be regenerated is the metadata —
+which is why that lives in Postgres (`watermarks.metadata`).
+
+Keeping user media would also contradict what the Verify page promises about
+uploads. Keeping nothing makes one policy true everywhere.
+
+Practical consequences:
+
+- On hosts with an ephemeral filesystem (Render's free tier, most container
+  platforms) `/files/<name>` works while the container is warm and 404s after a
+  deploy or a wake from sleep. The Dashboard treats a miss as expected and says so.
+- Because `/encode` rejects a reused `media_id` (the UNIQUE index from migration
+  002), losing a downloaded file would otherwise burn that id permanently.
+  `DELETE /me/media/{id}` frees it, so re-encoding under the same name is possible.
+
+If you *do* want durable media, add object storage (Supabase Storage is the
+natural fit) rather than relying on the local disk — but note a lossless FFV1
+video is ~22 MB, so a 1 GB free tier holds roughly 45 of them.
 
 ## Output format (locked-in by design)
 

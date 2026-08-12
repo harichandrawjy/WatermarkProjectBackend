@@ -90,6 +90,25 @@ app.add_middleware(
 )
 
 # Serve watermarked outputs at /files/<name>
+# Serve watermarked outputs at /files/<name>.
+#
+# RETENTION: none is promised.  These files live on the container's local disk,
+# which on most hosts (including Render's free tier) is ephemeral — a deploy or
+# a wake-from-sleep gives the process an empty directory back.
+#
+# That is deliberate rather than tolerated.  Encoding is DETERMINISTIC: the same
+# original + owner + media_id yields a byte-identical file every time, because
+# the signature, chain tag and QIM lattice all derive from those inputs via
+# SHA-256.  So the watermarked file is not unrecoverable data — it is a pure
+# function of things the user already has, and it was handed to them at encode
+# time.  What genuinely cannot be regenerated is the metadata, and that lives
+# in Postgres.
+#
+# Storing user media would also contradict what the Verify page promises about
+# uploads.  Keeping nothing makes one policy true everywhere.
+#
+# The practical effect: /files/<name> works while the container is warm and
+# 404s afterwards.  The frontend treats a miss as expected and says so.
 app.mount("/files", StaticFiles(directory=str(OUTPUT_DIR)), name="files")
 
 
@@ -274,7 +293,18 @@ def auth_refresh(body: RefreshBody):
 
 @app.get("/auth/me")
 def auth_me(user: dict = Depends(get_current_user)):
-    return {"id": user["id"], "email": user["email"]}
+    # Includes the short_id so the UI can tell the user which identifier is
+    # actually embedded in their files. Without it the Results page shows an
+    # 8-character tag the user has never been told about, which reads as a
+    # decoding error rather than as their own owner id.
+    #
+    # Allocates on first call rather than waiting for first encode — knowing
+    # the id before you use it is more useful than discovering it afterwards.
+    try:
+        short_id = _get_or_create_short_id(user)
+    except Exception:
+        short_id = None
+    return {"id": user["id"], "email": user["email"], "short_id": short_id}
 
 
 class ForgotBody(BaseModel):
@@ -465,6 +495,26 @@ async def encode(
     #   owner       — the assigned 8-char short_id that IS embedded.  Using the
     #                 email here would truncate to its first 8 bytes and merge
     #                 distinct accounts into one owner (see migration 003).
+    # The engine embeds media_id into a fixed MEDIA_ID_BYTES slot, so anything
+    # longer is silently truncated — "foto_jokowi" would become "foto_jok",
+    # and the verify screen would then report an "extracted" value that looks
+    # wrong to the user even though it is correct. Reject it instead, so what
+    # they type is what lands in the pixels.
+    #
+    # Measured in BYTES, not characters: one non-ASCII character can occupy up
+    # to four of them, so a 4-character CJK id would overflow an 8-byte slot.
+    # The frontend's maxLength is a convenience; this is the actual guarantee.
+    media_id = media_id.strip()
+    if not media_id:
+        raise HTTPException(400, "Media ID is required.")
+    n_bytes = len(media_id.encode("utf-8"))
+    if n_bytes > MEDIA_ID_BYTES:
+        raise HTTPException(
+            400,
+            f"Media ID is {n_bytes} bytes; the watermark carries at most "
+            f"{MEDIA_ID_BYTES}. Use a shorter id so it embeds exactly as typed."
+        )
+
     owner_email = user["email"]
     owner       = _get_or_create_short_id(user)
 
@@ -538,6 +588,10 @@ async def encode(
             "kind":      kind,
             "metadata":  meta_jsonable,
             "user_id":   user["id"],
+            # Display only — the media id is the identifier. Kept because it is
+            # what a user actually recognises a row by; `file.filename` was
+            # previously read for the extension and then thrown away.
+            "file_name": file.filename,
         }).execute()
     except Exception as e:
         # Race-proof backstop for the unique index — clean up the orphan file
@@ -590,6 +644,45 @@ def get_my_metadata(file_id: str, user: dict = Depends(get_current_user)):
     if not res.data:
         raise HTTPException(404, "Not found or not yours")
     return res.data[0]["metadata"]
+
+
+@app.delete("/me/media/{file_id}")
+def delete_my_media(file_id: str, user: dict = Depends(get_current_user)):
+    """Delete one of the caller's encode records, freeing its media_id.
+
+    Needed because encoding is deterministic but the app forbids repeats: the
+    same original + owner + media_id always produces a byte-identical file, yet
+    /encode rejects a reused media_id with a 409 (the UNIQUE index from
+    migration 002 enforces it).  Without a way to remove the record, a user who
+    loses their downloaded file has permanently burned that media_id — they can
+    neither re-download it nor regenerate it under the same name.
+
+    Scoped by user_id so one account cannot delete another's record, and the
+    row is fetched first so a missing id is a clean 404 rather than a silent
+    no-op reported as success.
+
+    The watermark already embedded in copies out in the world is unaffected —
+    deleting the record only means /lookup can no longer resolve it.
+    """
+    res = (
+        supabase.table("watermarks")
+        .select("id, kind, media")
+        .eq("id", file_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(404, "Not found or not yours")
+    row = res.data[0]
+
+    supabase.table("watermarks").delete().eq("id", file_id).eq("user_id", user["id"]).execute()
+
+    # Drop the local copy too if this container still happens to hold one.
+    ext = "mkv" if row.get("kind") == "video" else "png"
+    (OUTPUT_DIR / f"{file_id}_wm.{ext}").unlink(missing_ok=True)
+
+    return {"deleted": file_id, "media": row.get("media")}
 
 
 @app.get("/metadata/{file_id}")
