@@ -174,6 +174,30 @@ class _FFmpegWriter:
 # EMBED VIDEO
 # ──────────────────────────────────────────────────────────────
 
+def _draw_visible_text_bgr(bgr: np.ndarray, text: str) -> np.ndarray:
+    """Burn a semi-transparent text label into the bottom-right of a BGR frame.
+
+    Mirrors the image path in main.py (`_apply_visible_watermark`): white glyphs
+    with a dark drop-shadow so the mark stays legible over any content.  Drawn
+    on the frame BEFORE the invisible embed so both watermark layers coexist.
+    Font scale and margin track the frame width for a consistent look across
+    resolutions.  Mutates and returns `bgr`.
+    """
+    h, w = bgr.shape[:2]
+    font      = cv2.FONT_HERSHEY_SIMPLEX
+    scale     = max(0.6, w / 1000.0)
+    thickness = max(1, int(round(scale * 2)))
+    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
+    margin = max(8, w // 50)
+    x = w - tw - margin
+    y = h - margin - baseline            # baseline sits above the bottom margin
+    cv2.putText(bgr, text, (x + 2, y + 2), font, scale, (0, 0, 0),
+                thickness + 1, cv2.LINE_AA)          # shadow
+    cv2.putText(bgr, text, (x, y),         font, scale, (255, 255, 255),
+                thickness, cv2.LINE_AA)              # label
+    return bgr
+
+
 def embed_video(
     input_path: str,
     output_path: str,
@@ -181,6 +205,7 @@ def embed_video(
     media_id: str,
     embed_every_n_frames: int = 1,
     progress_callback=None,
+    visible_text: Optional[str] = None,
 ) -> Dict:
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -273,6 +298,12 @@ def embed_video(
         ret, bgr = cap.read()
         if not ret:
             break
+
+        # Visible "Aegis" overlay (when requested) goes on EVERY frame — before
+        # the invisible embed — so the visual mark is continuous and the two
+        # watermark layers coexist on the embedded frames.
+        if visible_text:
+            bgr = _draw_visible_text_bgr(bgr, visible_text)
 
         if frame_idx % embed_every_n_frames == 0:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)

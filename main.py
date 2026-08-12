@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageDraw, ImageFont
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -64,6 +64,21 @@ for d in (STORAGE_DIR, UPLOAD_DIR, OUTPUT_DIR):
 
 IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
+
+# Selectable OUTPUT formats, keyed by media kind.  Deliberately restricted to
+# LOSSLESS containers only: the invisible semi-fragile watermark lives in the
+# DCT/SVD + chroma-LSB layers, and any lossy codec (JPEG, H.264, VP8...)
+# perturbs those coefficients past the BCH + majority-vote recovery margin, so
+# a lossy re-encode would hand back a file that fails its own verification.
+#   image  → PNG / lossless WEBP
+#   video  → MKV / AVI, both written with the FFV1 lossless codec (see
+#            video_watermark.embed_video, which already routes .mkv/.avi
+#            through cv2.VideoWriter's FFV1 path).
+IMAGE_FORMATS = {"png": ".png", "webp": ".webp"}
+VIDEO_FORMATS = {"mkv": ".mkv", "avi": ".avi"}
+
+# The visible-overlay text for the "visible" encoder option.
+VISIBLE_WATERMARK_TEXT = "Aegis"
 
 
 app = FastAPI(title="Watermark API", version="1.0")
@@ -123,6 +138,47 @@ def _detect_kind(filename: str) -> str:
     if ext in VIDEO_EXTS:
         return "video"
     raise HTTPException(400, f"Unsupported file type: {ext}")
+
+
+def _apply_visible_watermark(img_array: np.ndarray, text: str = VISIBLE_WATERMARK_TEXT) -> np.ndarray:
+    """Burn a semi-transparent text label into the bottom-right corner.
+
+    Applied BEFORE the invisible embed so the two layers coexist: the invisible
+    watermark is then computed over the pixels that already carry the visible
+    mark, and both survive together in the lossless output.
+
+    White text with a dark drop-shadow keeps it legible over any background.
+    Font size and margin scale with the image so the mark looks consistent on
+    both thumbnails and full-resolution photos; a bundled TrueType font is used
+    when available, falling back to PIL's bitmap default otherwise.
+    """
+    base = Image.fromarray(img_array).convert("RGBA")
+    W, H = base.size
+    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    draw = ImageDraw.Draw(overlay)
+
+    font_size = max(16, W // 20)
+    font = None
+    for name in ("arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
+        try:
+            font = ImageFont.truetype(name, font_size)
+            break
+        except Exception:
+            continue
+    if font is None:
+        font = ImageFont.load_default()
+
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    margin = max(8, W // 50)
+    # Offset by bbox origin so the glyphs sit flush against the margin.
+    x = W - tw - margin - bbox[0]
+    y = H - th - margin - bbox[1]
+
+    draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 160))     # shadow
+    draw.text((x, y),         text, font=font, fill=(255, 255, 255, 220))  # label
+
+    return np.array(Image.alpha_composite(base, overlay).convert("RGB"))
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -485,9 +541,15 @@ def _get_or_create_short_id(user: dict) -> str:
 
 @app.post("/encode")
 async def encode(
-    file:     UploadFile = File(...),
-    media_id: str        = Form(...),
-    user:     dict       = Depends(get_current_user),
+    file:       UploadFile = File(...),
+    media_id:   str        = Form(...),
+    # "default" — invisible semi-fragile watermark only (original behaviour).
+    # "visible" — same invisible watermark PLUS a visible "Aegis" overlay.
+    encoder:    str        = Form("default"),
+    # Output container/format, validated against the media kind below.  Empty
+    # falls back to the lossless default (PNG for images, MKV for video).
+    out_format: str        = Form("", alias="format"),
+    user:       dict       = Depends(get_current_user),
 ):
     # Two different strings, deliberately:
     #   owner_email — the human-readable account, kept in the DB and returned
@@ -547,7 +609,29 @@ async def encode(
             f"Choose a media_id with a different first 8 characters."
         )
 
-    kind    = _detect_kind(file.filename)
+    kind = _detect_kind(file.filename)
+
+    # ── Resolve the requested encoder + output format ──
+    encoder = (encoder or "default").strip().lower()
+    if encoder not in ("default", "visible"):
+        raise HTTPException(400, "encoder must be 'default' or 'visible'.")
+    visible = encoder == "visible"
+
+    # Pick the format table for this media kind, so an image can't request a
+    # video container (or vice-versa) and a lossy pick can't slip through.
+    fmt_table = IMAGE_FORMATS if kind == "image" else VIDEO_FORMATS
+    fmt = (out_format or "").strip().lower()
+    if not fmt:
+        fmt = "png" if kind == "image" else "mkv"          # lossless defaults
+    if fmt not in fmt_table:
+        raise HTTPException(
+            400,
+            f"Unsupported {kind} format '{fmt}'. "
+            f"Choose one of: {', '.join(fmt_table)} (lossless only — the "
+            f"invisible watermark cannot survive a lossy re-encode)."
+        )
+    out_ext = fmt_table[fmt]
+
     file_id = uuid.uuid4().hex[:12]
     in_ext  = os.path.splitext(file.filename)[1].lower()
     in_path = UPLOAD_DIR / f"{file_id}_input{in_ext}"
@@ -555,15 +639,25 @@ async def encode(
     in_path.write_bytes(await file.read())
 
     if kind == "image":
-        # Force lossless PNG output so the watermark survives.
-        out_path = OUTPUT_DIR / f"{file_id}_wm.png"
+        out_path = OUTPUT_DIR / f"{file_id}_wm{out_ext}"
         img      = np.array(Image.open(in_path).convert("RGB"))
+        # Visible "Aegis" mark goes on FIRST so the invisible watermark embeds
+        # over it and both layers coexist in the lossless output.
+        if visible:
+            img = _apply_visible_watermark(img)
         wm, meta = embed_image(img, owner, media_id)
-        Image.fromarray(wm).save(out_path)
+        # WEBP must be told to stay lossless; PNG is lossless by definition.
+        if fmt == "webp":
+            Image.fromarray(wm).save(out_path, format="WEBP", lossless=True)
+        else:
+            Image.fromarray(wm).save(out_path)
     else:
-        # Force lossless MKV (FFV1) output so the watermark survives.
-        out_path = OUTPUT_DIR / f"{file_id}_wm.mkv"
-        meta     = embed_video(str(in_path), str(out_path), owner, media_id)
+        # MKV/AVI both route through the FFV1 lossless codec in embed_video.
+        out_path = OUTPUT_DIR / f"{file_id}_wm{out_ext}"
+        meta     = embed_video(
+            str(in_path), str(out_path), owner, media_id,
+            visible_text=VISIBLE_WATERMARK_TEXT if visible else None,
+        )
 
     # The original upload has served its purpose — embedding (and, for video,
     # the audio mux) is finished.  Drop it now rather than leaving user media
@@ -679,8 +773,10 @@ def delete_my_media(file_id: str, user: dict = Depends(get_current_user)):
     supabase.table("watermarks").delete().eq("id", file_id).eq("user_id", user["id"]).execute()
 
     # Drop the local copy too if this container still happens to hold one.
-    ext = "mkv" if row.get("kind") == "video" else "png"
-    (OUTPUT_DIR / f"{file_id}_wm.{ext}").unlink(missing_ok=True)
+    # The output extension now varies with the chosen format (png/webp/mkv/avi),
+    # so remove whichever "<id>_wm.*" file exists rather than assuming one.
+    for p in OUTPUT_DIR.glob(f"{file_id}_wm.*"):
+        p.unlink(missing_ok=True)
 
     return {"deleted": file_id, "media": row.get("media")}
 
