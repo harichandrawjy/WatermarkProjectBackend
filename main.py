@@ -16,6 +16,7 @@ Endpoints:
 import sys
 import os
 import io
+import re
 import uuid
 import json
 import base64
@@ -24,11 +25,13 @@ from pathlib import Path
 from typing import Any
 
 import numpy as np
-from PIL import Image, ImageDraw, ImageFont
+from scipy import ndimage
+from PIL import Image
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel, EmailStr
 
 from auth import get_current_user, get_optional_user
@@ -39,7 +42,7 @@ if not ENGINE_DIR.exists():
 sys.path.insert(0, str(ENGINE_DIR))
 
 from watermark_engine import (
-    embed_image, verify_image, SPATIAL_BLOCK,
+    embed_image, verify_image, SPATIAL_BLOCK, LSB_SUB_BLOCK_SIZE,
     _verify_channel, _parse_meta_payload,
     bch_decode_bits, array_to_bytes,
     to_float_ycbcr, META_PAYLOAD_BYTES,
@@ -77,8 +80,6 @@ VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 IMAGE_FORMATS = {"png": ".png", "webp": ".webp"}
 VIDEO_FORMATS = {"mkv": ".mkv", "avi": ".avi"}
 
-# The visible-overlay text for the "visible" encoder option.
-VISIBLE_WATERMARK_TEXT = "Aegis"
 
 
 app = FastAPI(title="Watermark API", version="1.0")
@@ -102,6 +103,10 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    # Response headers are hidden from cross-origin JS unless named here, so
+    # /media/{id} could set X-Output-Filename and the frontend would still read
+    # null. Only safelisted headers are visible by default.
+    expose_headers=["X-Output-Filename"],
 )
 
 # Serve watermarked outputs at /files/<name>
@@ -140,45 +145,6 @@ def _detect_kind(filename: str) -> str:
     raise HTTPException(400, f"Unsupported file type: {ext}")
 
 
-def _apply_visible_watermark(img_array: np.ndarray, text: str = VISIBLE_WATERMARK_TEXT) -> np.ndarray:
-    """Burn a semi-transparent text label into the bottom-right corner.
-
-    Applied BEFORE the invisible embed so the two layers coexist: the invisible
-    watermark is then computed over the pixels that already carry the visible
-    mark, and both survive together in the lossless output.
-
-    White text with a dark drop-shadow keeps it legible over any background.
-    Font size and margin scale with the image so the mark looks consistent on
-    both thumbnails and full-resolution photos; a bundled TrueType font is used
-    when available, falling back to PIL's bitmap default otherwise.
-    """
-    base = Image.fromarray(img_array).convert("RGBA")
-    W, H = base.size
-    overlay = Image.new("RGBA", base.size, (0, 0, 0, 0))
-    draw = ImageDraw.Draw(overlay)
-
-    font_size = max(16, W // 20)
-    font = None
-    for name in ("arial.ttf", "DejaVuSans-Bold.ttf", "DejaVuSans.ttf"):
-        try:
-            font = ImageFont.truetype(name, font_size)
-            break
-        except Exception:
-            continue
-    if font is None:
-        font = ImageFont.load_default()
-
-    bbox = draw.textbbox((0, 0), text, font=font)
-    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
-    margin = max(8, W // 50)
-    # Offset by bbox origin so the glyphs sit flush against the margin.
-    x = W - tw - margin - bbox[0]
-    y = H - th - margin - bbox[1]
-
-    draw.text((x + 2, y + 2), text, font=font, fill=(0, 0, 0, 160))     # shadow
-    draw.text((x, y),         text, font=font, fill=(255, 255, 255, 220))  # label
-
-    return np.array(Image.alpha_composite(base, overlay).convert("RGB"))
 
 
 def _to_jsonable(obj: Any) -> Any:
@@ -198,6 +164,36 @@ def _to_jsonable(obj: Any) -> Any:
     if isinstance(obj, bytes):
         return base64.b64encode(obj).decode("ascii")
     return obj
+
+
+def _embedded_pattern_data_url(img_shape, owner_id: str, media_id: str, frame_id: int = 0):
+    """The fragile watermark pattern that gets embedded, as a PNG data URL.
+
+    Regenerated rather than returned by the engine, because it is fully
+    determined by (owner, media, frame): the same SHA-256 derivation both the
+    encoder and the decoder run. That is the point worth showing a user — the
+    watermark is not stored anywhere, it is *computed* from the identity, which
+    is why the verifier can rebuild it and compare.
+
+    The grid is one cell per LSB_SUB_BLOCK_SIZE (16) pixels of the chroma
+    channel, matching what Verify renders after extraction so the two images
+    are directly comparable.
+    """
+    try:
+        from watermark_engine import (          # noqa: PLC0415
+            _master_signature, _compute_lsb_target_pattern, LSB_SUB_BLOCK_SIZE,
+        )
+        h, w = int(img_shape[0]), int(img_shape[1])
+        n_sub_h, n_sub_w = h // LSB_SUB_BLOCK_SIZE, w // LSB_SUB_BLOCK_SIZE
+        if n_sub_h < 1 or n_sub_w < 1:
+            return None
+        sig = _master_signature(owner_id, media_id, frame_id)
+        pattern = _compute_lsb_target_pattern(n_sub_h, n_sub_w, sig, frame_id)
+        return _pattern_to_data_url(pattern)
+    except Exception as e:
+        # Illustrative only — never fail an encode over a preview image.
+        print(f"[encode] watermark pattern preview unavailable: {e}")
+        return None
 
 
 def _spatial_to_regions(spatial_map):
@@ -246,6 +242,74 @@ def _pattern_to_data_url(grid, mismatch=None, scale: int = 10):
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _mask_to_data_url(mask, scale: int = 10):
+    """Render a 2D bool mismatch grid as a TRANSPARENT PNG, red where flagged.
+
+    The sibling `_pattern_to_data_url` paints red onto the opaque black/white
+    pattern, which is right for the side-by-side comparison but useless over a
+    photo — the noise texture would hide the image entirely.  Here only the
+    flagged cells are drawn, so the overlay localises tampering on the real
+    picture and nothing else.
+
+    Returns None when nothing is flagged: an all-transparent PNG is bytes spent
+    to draw nothing, and the caller can branch on its absence.
+    """
+    if mask is None:
+        return None
+    m = np.asarray(mask).astype(bool)
+    if m.ndim != 2 or m.size == 0 or not m.any():
+        return None
+    h, w = m.shape
+    rgba = np.zeros((h, w, 4), dtype=np.uint8)
+    rgba[m] = (244, 63, 94, 255)                     # rose-500, fully opaque
+    img = Image.fromarray(rgba, mode="RGBA").resize((w * scale, h * scale), Image.NEAREST)
+    buf = io.BytesIO()
+    img.save(buf, format="PNG")
+    return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def _mask_to_clusters(mask, min_cells: int = 3):
+    """Bounding box of each connected group of flagged cells, in image pixels.
+
+    The layer flags a conservative SUBSET of an edited region — measured
+    precision ~1.0 but recall ~0.4 — so the raw cells read as scattered
+    confetti rather than as one tampered area.  Grouping them says "these
+    belong to the same edit" without colouring in a single cell that did not
+    actually fail its parity check.
+
+    The box is the extent of the FLAGGED CELLS, which is a lower bound on the
+    edit: because recall is well under 1, the real edit may run past it.  The
+    UI has to label it as such rather than as the edited region.
+
+    Singletons and pairs are dropped — an isolated flipped cell is the
+    quantization noise floor MIN_TAMPER_BLOCKS exists to reject, and boxing it
+    would give it more weight than the evidence supports.
+    """
+    if mask is None:
+        return []
+    m = np.asarray(mask).astype(bool)
+    if m.ndim != 2 or m.size == 0 or not m.any():
+        return []
+    # 8-connectivity: diagonal neighbours belong to the same edit, and at this
+    # recall a cluster is frequently only diagonally joined.
+    labels, n = ndimage.label(m, structure=np.ones((3, 3), dtype=int))
+    out = []
+    for sl_y, sl_x in ndimage.find_objects(labels)[:n]:
+        cells = int(m[sl_y, sl_x].sum())
+        if cells < min_cells:
+            continue
+        out.append({
+            "x":     int(sl_x.start * LSB_SUB_BLOCK_SIZE),
+            "y":     int(sl_y.start * LSB_SUB_BLOCK_SIZE),
+            "w":     int((sl_x.stop - sl_x.start) * LSB_SUB_BLOCK_SIZE),
+            "h":     int((sl_y.stop - sl_y.start) * LSB_SUB_BLOCK_SIZE),
+            "cells": cells,
+        })
+    # Biggest first, so the UI can label the dominant edit without re-sorting.
+    out.sort(key=lambda c: c["cells"], reverse=True)
+    return out
 
 
 # ──────────────────────────────────────────────────────────────
@@ -543,9 +607,6 @@ def _get_or_create_short_id(user: dict) -> str:
 async def encode(
     file:       UploadFile = File(...),
     media_id:   str        = Form(...),
-    # "default" — invisible semi-fragile watermark only (original behaviour).
-    # "visible" — same invisible watermark PLUS a visible "Aegis" overlay.
-    encoder:    str        = Form("default"),
     # Output container/format, validated against the media kind below.  Empty
     # falls back to the lossless default (PNG for images, MKV for video).
     out_format: str        = Form("", alias="format"),
@@ -611,12 +672,7 @@ async def encode(
 
     kind = _detect_kind(file.filename)
 
-    # ── Resolve the requested encoder + output format ──
-    encoder = (encoder or "default").strip().lower()
-    if encoder not in ("default", "visible"):
-        raise HTTPException(400, "encoder must be 'default' or 'visible'.")
-    visible = encoder == "visible"
-
+    # ── Resolve the requested output format ──
     # Pick the format table for this media kind, so an image can't request a
     # video container (or vice-versa) and a lossy pick can't slip through.
     fmt_table = IMAGE_FORMATS if kind == "image" else VIDEO_FORMATS
@@ -638,14 +694,18 @@ async def encode(
 
     in_path.write_bytes(await file.read())
 
+    # The fragile watermark pattern that gets embedded, rendered as an image so
+    # the user can SEE what a watermark actually is rather than being told one
+    # exists.  Verify already shows this pattern next to the one recovered from
+    # a file; showing it at encode time gives the "before" half of that
+    # comparison, which is where the concept has to land first.
+    wm_pattern_url = None
+
     if kind == "image":
         out_path = OUTPUT_DIR / f"{file_id}_wm{out_ext}"
         img      = np.array(Image.open(in_path).convert("RGB"))
-        # Visible "Aegis" mark goes on FIRST so the invisible watermark embeds
-        # over it and both layers coexist in the lossless output.
-        if visible:
-            img = _apply_visible_watermark(img)
         wm, meta = embed_image(img, owner, media_id)
+        wm_pattern_url = _embedded_pattern_data_url(img.shape, owner, media_id)
         # WEBP must be told to stay lossless; PNG is lossless by definition.
         if fmt == "webp":
             Image.fromarray(wm).save(out_path, format="WEBP", lossless=True)
@@ -654,10 +714,14 @@ async def encode(
     else:
         # MKV/AVI both route through the FFV1 lossless codec in embed_video.
         out_path = OUTPUT_DIR / f"{file_id}_wm{out_ext}"
-        meta     = embed_video(
-            str(in_path), str(out_path), owner, media_id,
-            visible_text=VISIBLE_WATERMARK_TEXT if visible else None,
-        )
+        meta     = embed_video(str(in_path), str(out_path), owner, media_id)
+        res = meta.get("resolution", "")
+        if "x" in res:
+            w_s, h_s = res.split("x")[:2]
+            # Frame 0's pattern — each frame is keyed by its own frame_id, so
+            # this is representative rather than universal.
+            wm_pattern_url = _embedded_pattern_data_url(
+                (int(h_s), int(w_s), 3), owner, media_id, frame_id=0)
 
     # The original upload has served its purpose — embedding (and, for video,
     # the audio mux) is finished.  Drop it now rather than leaving user media
@@ -707,6 +771,9 @@ async def encode(
         "metadata_url":    f"/metadata/{file_id}",
         "metadata":        meta_jsonable,
         "psnr_db":         meta.get("psnr_db") or meta.get("psnr_y_mean_db"),
+        # PNG data URL of the fragile pattern now living in the file's chroma
+        # channel — the same image Verify compares against after extraction.
+        "watermark_pattern": wm_pattern_url,
     }
 
 
@@ -779,6 +846,47 @@ def delete_my_media(file_id: str, user: dict = Depends(get_current_user)):
         p.unlink(missing_ok=True)
 
     return {"deleted": file_id, "media": row.get("media")}
+
+
+@app.get("/media/{file_id}")
+def get_media_by_id(file_id: str):
+    """Serve a watermarked output by encode id, whatever its extension is.
+
+    The output format became user-selectable (png/webp for images, mkv/avi for
+    video) but is not stored on the row, so a caller holding only the id cannot
+    know the filename.  The Dashboard used to guess it from `kind` — always
+    `.png` or `.mkv` — which silently 404s for anything encoded as WEBP or AVI
+    even while the file sits in the directory.
+
+    Resolving server-side by glob avoids a migration and fixes existing rows
+    too.  Deliberately NOT under /files: that path is a StaticFiles mount, which
+    would match this route first and try to serve a file literally named
+    "by-id/...".
+
+    Public, matching the /files mount it complements — no access regression.
+    """
+    # `file_id` reaches a glob pattern, so a traversal like "../../etc/passwd"
+    # would escape OUTPUT_DIR.  Ids are hex from uuid4, so anything outside
+    # this character class is already invalid.
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", file_id):
+        raise HTTPException(400, "Invalid id")
+
+    matches = sorted(OUTPUT_DIR.glob(f"{file_id}_wm.*"))
+    if not matches:
+        raise HTTPException(
+            404,
+            "That file is no longer on the server. Watermarked media is not "
+            "retained — use the copy downloaded at encode time, or re-encode."
+        )
+
+    path = matches[0]
+    return FileResponse(
+        path,
+        filename=path.name,
+        # Lets the browser-side download name the file with the right extension
+        # without the frontend having to guess it back.
+        headers={"X-Output-Filename": path.name},
+    )
 
 
 @app.get("/metadata/{file_id}")
@@ -1111,6 +1219,13 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int) -> di
         "watermarkOriginal":  _pattern_to_data_url(v.get("wm_target_pattern")),
         "watermarkExtracted": _pattern_to_data_url(
             v.get("wm_extracted_pattern"), v.get("wm_display_mismatch")),
+        # The same flagged cells again, but transparent — for laying over the
+        # source photo client-side.  Images only: video frames already carry two
+        # base64 PNGs each, and a third per frame would bloat those responses.
+        "watermarkMask": _mask_to_data_url(v.get("wm_display_mismatch")),
+        # Bounding boxes grouping those cells into edits. A lower bound on each
+        # edited region, not its true extent — see _mask_to_clusters.
+        "watermarkClusters": _mask_to_clusters(v.get("wm_display_mismatch")),
     }
 
 
