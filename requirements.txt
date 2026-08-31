@@ -2,7 +2,9 @@ fastapi>=0.110
 uvicorn[standard]>=0.27
 python-multipart>=0.0.9
 numpy>=1.24
-Pillow>=10.0
+# 11.3 is the first release bundling libavif, so AVIF uploads decode natively.
+# Below it main.py silently drops .avif from IMAGE_EXTS rather than failing.
+Pillow>=11.3
 opencv-python>=4.8
 imageio-ffmpeg>=0.4
 PyWavelets>=1.4

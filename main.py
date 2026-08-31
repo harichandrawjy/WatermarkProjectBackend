@@ -2,7 +2,7 @@
 Watermark API
 =============
 FastAPI bridge between the React frontend (../Website) and the
-LWT/DCT/SVD watermark engine (./engine).
+LWT/SVD watermark engine (./engine).
 
 Endpoints:
   POST /encode  — multipart upload + owner/media_id form fields.
@@ -26,7 +26,7 @@ from typing import Any
 
 import numpy as np
 from scipy import ndimage
-from PIL import Image
+from PIL import Image, features
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
@@ -65,12 +65,27 @@ OUTPUT_DIR  = STORAGE_DIR / "outputs"
 for d in (STORAGE_DIR, UPLOAD_DIR, OUTPUT_DIR):
     d.mkdir(parents=True, exist_ok=True)
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png"}
+# Accepted INPUT extensions.  Decoding itself is format-agnostic — every path
+# goes through Image.open(...).convert("RGB") — so this set is purely a gate,
+# and anything Pillow can read is safe to list.
+#
+# .webp is REQUIRED here, not optional: IMAGE_FORMATS below offers WEBP as an
+# output format, so leaving it out meant the app handed back a file it would
+# then refuse on /verify and /lookup — the round trip was broken for every
+# WEBP encode.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".webp"}
+
+# AVIF decoding only ships with Pillow >= 11.3 (libavif).  Advertise it only
+# when this build can actually decode it, so an older Pillow returns a clean
+# 400 "unsupported" instead of a 500 from inside the decoder.
+if features.check("avif"):
+    IMAGE_EXTS.add(".avif")
+
 VIDEO_EXTS = {".mp4", ".mkv", ".avi", ".mov", ".webm"}
 
 # Selectable OUTPUT formats, keyed by media kind.  Deliberately restricted to
 # LOSSLESS containers only: the invisible semi-fragile watermark lives in the
-# DCT/SVD + chroma-LSB layers, and any lossy codec (JPEG, H.264, VP8...)
+# SVD + chroma-LSB layers, and any lossy codec (JPEG, H.264, VP8...)
 # perturbs those coefficients past the BCH + majority-vote recovery margin, so
 # a lossy re-encode would hand back a file that fails its own verification.
 #   image  → PNG / lossless WEBP
@@ -270,41 +285,60 @@ def _mask_to_data_url(mask, scale: int = 10):
     return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
 
 
-def _mask_to_clusters(mask, min_cells: int = 3):
-    """Bounding box of each connected group of flagged cells, in image pixels.
+# Cells within this many cells of each other are treated as one edit. At
+# LSB_SUB_BLOCK_SIZE=16 that is a 48px gap tolerance, chosen by measurement:
+# strict adjacency (radius 0) splits even a single spliced block into 2 boxes
+# and a handwritten annotation into 4, while radius 3 reports both correctly
+# and still keeps two separate splices apart. Over-merging is the safer error —
+# it under-counts distinct edits, whereas under-merging invents them.
+CLUSTER_GROUP_RADIUS = 3
+
+
+def _mask_to_clusters(mask, min_cells: int = 3, radius: int = CLUSTER_GROUP_RADIUS):
+    """Group flagged cells into edits and box each one, in image pixels.
 
     The layer flags a conservative SUBSET of an edited region — measured
     precision ~1.0 but recall ~0.4 — so the raw cells read as scattered
-    confetti rather than as one tampered area.  Grouping them says "these
-    belong to the same edit" without colouring in a single cell that did not
-    actually fail its parity check.
+    confetti rather than as one tampered area. Grouping says "these belong to
+    the same edit" without colouring in a cell that did not actually fail its
+    parity check.
 
-    The box is the extent of the FLAGGED CELLS, which is a lower bound on the
-    edit: because recall is well under 1, the real edit may run past it.  The
+    Proximity, not adjacency, decides membership: a thin edit (handwriting, a
+    drawn line) flags cells in a dashed trail with gaps, so requiring cells to
+    touch fragments one annotation into several boxes or, when every fragment
+    lands under `min_cells`, into none at all.
+
+    Dilation only decides WHICH cells group together — each box is then the
+    extent of the real flagged cells inside its group, never of the dilated
+    region. The box is therefore a statement about what was detected, and
+    because recall is well under 1 the true edit routinely runs past it; the
     UI has to label it as such rather than as the edited region.
 
-    Singletons and pairs are dropped — an isolated flipped cell is the
-    quantization noise floor MIN_TAMPER_BLOCKS exists to reject, and boxing it
-    would give it more weight than the evidence supports.
+    Groups under `min_cells` are dropped: an isolated flipped cell with nothing
+    near it is the quantization noise floor MIN_TAMPER_BLOCKS exists to reject,
+    and boxing it would give it more weight than the evidence supports.
     """
     if mask is None:
         return []
     m = np.asarray(mask).astype(bool)
     if m.ndim != 2 or m.size == 0 or not m.any():
         return []
-    # 8-connectivity: diagonal neighbours belong to the same edit, and at this
-    # recall a cluster is frequently only diagonally joined.
-    labels, n = ndimage.label(m, structure=np.ones((3, 3), dtype=int))
+    k = 2 * radius + 1
+    grown = ndimage.binary_dilation(m, np.ones((k, k), dtype=bool))
+    # 8-connectivity on top of the dilation, so diagonal contact also joins.
+    labels, n = ndimage.label(grown, structure=np.ones((3, 3), dtype=int))
     out = []
-    for sl_y, sl_x in ndimage.find_objects(labels)[:n]:
-        cells = int(m[sl_y, sl_x].sum())
+    for i in range(1, n + 1):
+        cells_mask = m & (labels == i)
+        cells = int(cells_mask.sum())
         if cells < min_cells:
             continue
+        ys, xs = np.nonzero(cells_mask)
         out.append({
-            "x":     int(sl_x.start * LSB_SUB_BLOCK_SIZE),
-            "y":     int(sl_y.start * LSB_SUB_BLOCK_SIZE),
-            "w":     int((sl_x.stop - sl_x.start) * LSB_SUB_BLOCK_SIZE),
-            "h":     int((sl_y.stop - sl_y.start) * LSB_SUB_BLOCK_SIZE),
+            "x":     int(xs.min() * LSB_SUB_BLOCK_SIZE),
+            "y":     int(ys.min() * LSB_SUB_BLOCK_SIZE),
+            "w":     int((xs.max() - xs.min() + 1) * LSB_SUB_BLOCK_SIZE),
+            "h":     int((ys.max() - ys.min() + 1) * LSB_SUB_BLOCK_SIZE),
             "cells": cells,
         })
     # Biggest first, so the UI can label the dominant edit without re-sorting.
@@ -1056,6 +1090,11 @@ def _record_verification(user: dict | None, resp: dict, meta: dict, kind: str) -
     one to attribute the run to.
     """
     if not user:
+        # Logged, not silent.  An anonymous call and an expired token produce
+        # the same empty history list in the UI, and without this line there is
+        # no way to tell them apart — the early return left no trace anywhere.
+        print("[verify] history SKIPPED: no authenticated caller "
+              "(token absent, malformed, or expired)")
         return
     try:
         claimed_owner = meta.get("owner_id")
@@ -1098,8 +1137,12 @@ def _record_verification(user: dict | None, resp: dict, meta: dict, kind: str) -
             "recovered_media":  resp.get("mediaId"),
             "watermark_id":     watermark_id,
         }).execute()
+        print(f"[verify] history RECORDED for user {user.get('id')}")
     except Exception as e:
-        print(f"[verify] history not recorded: {e}")
+        # Still swallowed — a logging failure must never cost the user their
+        # report — but named, so the cause is one line away instead of unknown.
+        print(f"[verify] history FAILED for user {user.get('id')}: "
+              f"{type(e).__name__}: {e}")
 
 
 @app.get("/me/verifications")
