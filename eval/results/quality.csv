@@ -1,0 +1,11 @@
+image,kind,width,height,psnr_db,ssim
+6645f90981339,photo,1024,672,42.19,0.99741
+beautiful-sunny-day-,photo,800,576,41.84,0.99421
+dark-city-pictures-7,photo,1024,640,42.52,0.98393
+Gravel_RatTrap-IMG_1,photo,1024,544,42.15,0.99753
+indonesian-e-passpor,photo,1024,704,42.09,0.99928
+Lenna_(test_image),photo,512,512,41.19,0.99173
+rear-view-group-youn,photo,800,512,41.17,0.98646
+white-blank-concrete,photo,736,736,42.0,0.99367
+synth-gradient,synthetic,512,512,39.29,0.93791
+synth-texture,synthetic,512,512,41.55,0.99947
