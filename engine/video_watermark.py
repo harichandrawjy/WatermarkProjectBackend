@@ -47,7 +47,7 @@ from watermark_engine import (
     OWNER_REPEATS, MEDIA_REPEATS, FRAME_REPEATS, CHAIN_REPEATS,
     FRAME_ID_BITS, CHAIN_TAG_BITS,
 
-    BER_TAMPER_THRESHOLD, MIN_TAMPER_BLOCKS,
+    BER_TAMPER_THRESHOLD, MIN_TAMPER_BLOCKS_VIDEO, LSB_QIM_STEP_VIDEO,
 )
 import struct
 
@@ -174,30 +174,6 @@ class _FFmpegWriter:
 # EMBED VIDEO
 # ──────────────────────────────────────────────────────────────
 
-def _draw_visible_text_bgr(bgr: np.ndarray, text: str) -> np.ndarray:
-    """Burn a semi-transparent text label into the bottom-right of a BGR frame.
-
-    Mirrors the image path in main.py (`_apply_visible_watermark`): white glyphs
-    with a dark drop-shadow so the mark stays legible over any content.  Drawn
-    on the frame BEFORE the invisible embed so both watermark layers coexist.
-    Font scale and margin track the frame width for a consistent look across
-    resolutions.  Mutates and returns `bgr`.
-    """
-    h, w = bgr.shape[:2]
-    font      = cv2.FONT_HERSHEY_SIMPLEX
-    scale     = max(0.6, w / 1000.0)
-    thickness = max(1, int(round(scale * 2)))
-    (tw, th), baseline = cv2.getTextSize(text, font, scale, thickness)
-    margin = max(8, w // 50)
-    x = w - tw - margin
-    y = h - margin - baseline            # baseline sits above the bottom margin
-    cv2.putText(bgr, text, (x + 2, y + 2), font, scale, (0, 0, 0),
-                thickness + 1, cv2.LINE_AA)          # shadow
-    cv2.putText(bgr, text, (x, y),         font, scale, (255, 255, 255),
-                thickness, cv2.LINE_AA)              # label
-    return bgr
-
-
 def embed_video(
     input_path: str,
     output_path: str,
@@ -205,7 +181,6 @@ def embed_video(
     media_id: str,
     embed_every_n_frames: int = 1,
     progress_callback=None,
-    visible_text: Optional[str] = None,
 ) -> Dict:
     cap = cv2.VideoCapture(input_path)
     if not cap.isOpened():
@@ -302,8 +277,6 @@ def embed_video(
         # Visible "Aegis" overlay (when requested) goes on EVERY frame — before
         # the invisible embed — so the visual mark is continuous and the two
         # watermark layers coexist on the embedded frames.
-        if visible_text:
-            bgr = _draw_visible_text_bgr(bgr, visible_text)
 
         if frame_idx % embed_every_n_frames == 0:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
@@ -337,8 +310,8 @@ def embed_video(
             Y, Cb, Cr = to_float_ycbcr(rgb)
             Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_idx, extras)
 
-            # LSB layer on chroma — independent of Y's DCT/SVD watermark.
-            Cb_wm = _embed_lsb_chroma(Cb, signature, frame_idx)
+            # LSB layer on chroma — independent of Y's SVD watermark.
+            Cb_wm = _embed_lsb_chroma(Cb, signature, frame_idx, q=LSB_QIM_STEP_VIDEO)
 
             if info["n_meta_bits"] < len(meta_coded):
                 # Mirror embed_image: a frame too small to hold the BCH meta
@@ -367,6 +340,7 @@ def embed_video(
                 float(10.0 * np.log10(255.0 ** 2 / mse_y)) if mse_y > 0 else float("inf"))
             psnr_rgb_per_frame.append(
                 float(10.0 * np.log10(255.0 ** 2 / mse_rgb)) if mse_rgb > 0 else float("inf"))
+
 
             embedded_indices.append(frame_idx)
         else:
@@ -586,7 +560,8 @@ def verify_video(
                 # back to the playback index when the id couldn't be recovered.
                 sig_fid          = rec_fid if rec_fid is not None else frame_idx
                 signature        = _master_signature(owner_id, media_id, sig_fid)
-                lsb_res          = _verify_lsb_chroma(Cb, signature, sig_fid)
+                lsb_res          = _verify_lsb_chroma(Cb, signature, sig_fid,
+                                                      q=LSB_QIM_STEP_VIDEO)
                 combined_spatial = lsb_res["lsb_spatial_map"]
 
                 # Chain tag is validated against the expected chain for THIS
@@ -658,7 +633,7 @@ def verify_video(
                 # OWN frame_id (a forged / content-altered frame).  Deleting
                 # OTHER frames leaves all of these clean for the survivors, so
                 # there is no cascade.
-                content_tampered = bool(int(combined_spatial.sum()) >= MIN_TAMPER_BLOCKS)
+                content_tampered = bool(int(combined_spatial.sum()) >= MIN_TAMPER_BLOCKS_VIDEO)
                 self_chain_bad   = bool(parsed is not None and frame_id_valid and not chain_match)
                 id_mismatch      = not (owner_match and media_match)
                 frame_tampered   = bool(content_tampered or id_mismatch or self_chain_bad)

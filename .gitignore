@@ -13,3 +13,6 @@ storage/
 
 # Local env file (contains secrets)
 .env
+
+# Abandoned eval configurations kept locally for comparison
+eval/results_*_backup/

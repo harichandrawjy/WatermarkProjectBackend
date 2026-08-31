@@ -3,10 +3,10 @@ Semi-Fragile Watermarking Engine
 ==================================
 Pipeline:
 
-  Embed:  Y  → 2-level LWT → {LLLL, LLLH, LLHL} → DCT(8x8) → SVD → QIM on S[0] → IDWT.
+  Embed:  Y  → 2-level LWT → {LLLL, LLLH, LLHL} → 8x8 blocks → SVD → QIM on S[0] → IDWT.
           Cb → 16×16 block-mean LSB parity (orthogonal fragile layer).
 
-  Verify: Y  → 2-level LWT → {LLLL, LLLH, LLHL} → DCT(8x8) → SVD → extract bits →
+  Verify: Y  → 2-level LWT → {LLLL, LLLH, LLHL} → 8x8 blocks → SVD → extract bits →
                 BCH-decode → owner_id/media_id/frame_id (raw) + majority-vote fallback.
           Cb → block-mean LSB parity → spatial tamper map → decision.
 
@@ -25,6 +25,31 @@ Spatial tamper localisation is carried entirely by the chroma LSB layer.
 Temporal integrity (frame deletion / reorder) is handled by the
 BCH-protected frame_id in LLLL — see verify_video.
 
+Note on the absent DCT
+----------------------
+Earlier revisions ran an 8x8 orthonormal DCT on each block before the SVD.
+It was removed because it carries no information: an orthonormal DCT is
+D = C·B·Cᵀ with C orthogonal, and singular values are invariant under
+multiplication by orthogonal matrices, so S(D) == S(B) — measured equal to
+~1e-13 on real subbands.  Since only S[0] is modified and the block is rebuilt
+from the same U and Vᵀ, the inverse DCT then undoes the forward one.
+
+It was not, however, bit-exactly neutral, and the reason is worth knowing
+before touching the quantiser.  That residual ~1e-13 is enough to flip a
+`round(S0/step)` that sits almost exactly on a .5 boundary, which moves the
+block a whole QIM step (32.0).  The embedded BIT is unchanged — parity is
+forced either way — but the magnitude lands on the adjacent lattice point.
+Measured over the eval corpus: 7/10 images bit-identical, 3/10 differing by
+at most 16 levels, concentrated in flat regions where S0/step lands on
+boundaries often.  PSNR and SSIM came out marginally BETTER without the DCT,
+and the eval verdicts moved by 2 rows out of 190 (two JPEG q50 false alarms
+went away); the threshold sweep was unchanged.
+
+Note that this is specific to pairing DCT with SVD.  Embedding into a chosen
+DCT *coefficient* (the DC term, or a mid-frequency one) would NOT be
+redundant; it is rotation-invariance of the singular values that makes the
+transform vacuous here.  Do not re-add it without changing what is embedded.
+
 Note on LWT vs DWT
 ------------------
 For the Haar wavelet, the lifting-scheme implementation produces the
@@ -39,38 +64,99 @@ import json
 import struct
 from typing import Tuple, Optional, Dict, List
 import pywt
-from scipy.fft import dct, idct
 import galois
 
 
 # ──────────────────────────────────────────────────────────────
 # CONSTANTS
 # ──────────────────────────────────────────────────────────────
-BLOCK_SIZE        = 8       # DCT block size
+BLOCK_SIZE        = 8       # SVD block size
 QIM_STEP_ROBUST   = 32.0    # LLLL  — media meta, robust  (was 24.0)
 WAVELET           = 'haar'  # Haar (LWT-equivalent for this wavelet)
 DWT_LEVELS        = 2
-LSB_QIM_STEP           = 2.0
-LSB_BLOCK_TAMPER_RATIO = 0.45   # >45% sub-block disagreement → flag block.
-                                # Tuned so compression stays at 0 blocks while
-                                # 32x32+ edits flip enough sub-blocks to flag.
+# Quantiser step for the chroma block-mean parity layer.  MUST NOT be a power
+# of two.  The stored bit is parity(round(mean/q)), and negating an image maps
+# a Cb mean m to 256-m exactly (the Cb weights sum to zero, so the 255 terms
+# cancel).  Whenever 256/q is an even integer, parity(round((256-m)/q)) equals
+# parity(round(m/q)) for every m — the layer is then *provably blind* to
+# photometric negation at any region size.  That holds for q = 2, 4, 8, 16.
+#
+# With q=3, an embedded mean sits on a multiple of 3, so m = 3k and
+# round((256-3k)/3) = 85 - k.  85 is odd, so the bit flips every time:
+# negation goes from undetectable to always detected.  Measured 0/8 -> 8/8 on
+# 64px and larger regions.  See eval/.
+LSB_QIM_STEP           = 3.0    # images
+# Video uses a different step, and the reason is not tuning preference.
+# The fragile layer is blind to photometric negation whenever 256/q is an even
+# integer, which is every power of two - so an ODD step is required to detect it.
+# But the lossless video round trip drifts chroma just enough that an odd step
+# misreads a median of 15 blocks per frame, and a single flagged frame marks the
+# whole clip tampered. Measured: q=2 and q=4 leave video at 1 block/frame with
+# 37 clean frames; q=3 and q=5 leave 0 clean frames out of 134.
+# No single value satisfies both, so each medium gets the one it can use.
+LSB_QIM_STEP_VIDEO     = 2.0
+LSB_BLOCK_TAMPER_RATIO = 0.45   # >45% sub-block disagreement → flag block,
+                                # i.e. ≥2 of the 4 sub-cells in a 32x32 block.
+                                # Compression leaves clean images at 0 blocks;
+                                # edits clear it reliably from ~96x96 px up.
 # Spatial-block size — each level-2 wavelet coefficient covers 4x4 spatial
 # pixels, so an 8x8 coefficient block covers 32x32 pixels.  Used as the
 # block granularity for the chroma-LSB tamper map.
 SPATIAL_BLOCK = BLOCK_SIZE * (2 ** DWT_LEVELS)   # 32
 LSB_SUB_BLOCK_SIZE     = 16     # 16x16 sub-blocks → 4 LSB cells per 32x32 spatial block
 
+# Headroom reserved at both ends of the 8-bit range before embedding.
+#
+# Both layers work by MOVING a value: the robust layer shifts a singular value
+# by up to half a QIM step, the fragile layer shifts a block mean.  A pixel at
+# exactly 255 has nowhere to go up and one at exactly 0 nowhere to go down, so
+# the write is clipped away and the bit is silently lost.  Pure white is the
+# worst case: B<=255 forces Cb<=128 while G<=255 forces Cb>=128, leaving a legal
+# window of zero width.
+#
+# Screenshots, UI captures and scanned documents are full of exact #FFFFFF, and
+# before this they failed outright - identity unreadable, every block flagged.
+# Two levels is enough: 248 and 8 already worked, only the exact extremes did
+# not.  Photographs are unaffected (they contain few exact-extreme pixels) and
+# measure the same PSNR either way.
+SATURATION_HEADROOM = 2
+
 BER_TAMPER_THRESHOLD = 0.15  # Informational — kept for metadata back-compat.
 
 # Minimum number of flagged 32×32 spatial blocks required before a frame
-# (or image) is considered content-tampered.  The chroma-LSB layer is
-# quantization-noisy and routinely produces ~3 isolated false positives
-# per frame on a clean re-encode; setting this to 6 tolerates that floor
-# while still catching real tampering of a single 32×32 region or larger
-# (which collapses ~6+ blocks once the LSB sub-block aggregation rounds
-# borders).  Per-block sensitivity in the returned spatial map is
-# unchanged — every flagged block still surfaces in the heatmap.
-MIN_TAMPER_BLOCKS = 6
+# (or image) is considered content-tampered.  Re-derived after LSB_QIM_STEP
+# moved 2 -> 3, over 8 photos + 2 synthetic × 19 operations = 190 checks.
+# End-to-end verdicts (the shipped rule: blocks >= T OR identity broken):
+#
+#     T   splice  blank   32x32   edits    false alarms (of which block-only)
+#     1   10/10   10/10    9/10   29/30    40/160  (7)   <- chosen
+#     2    9/10   10/10    4/10   23/30    39/160  (6)
+#     3    9/10   10/10    0/10   19/30    39/160  (6)
+#     6    6/10    7/10    0/10   13/30    38/160  (5)
+#
+# T=1 buys ten extra detections for a single extra false alarm, so nothing
+# above it is defensible on this data.  It is safe only because q=3 collapsed
+# the noise floor: control, PNG re-save and low noise now flag exactly ZERO
+# blocks, so "one block" is already well clear of clean-image behaviour.
+# At q=2 the same T=1 cost 58/160 false alarms and was not viable.
+#
+# Most of the 40 false alarms are NOT block-driven — they are resize,
+# brightness and contrast breaking the robust identity layer, which no value
+# of T affects.  Only 7 come from the block count.
+#
+# Per-block sensitivity in the returned spatial map is unchanged — every
+# flagged block still surfaces in the heatmap.
+#
+# Note on the minimum detectable edit: a 32×32 edit spans at most 2×2 = 4
+# blocks, and 1 when block-aligned, so it is reachable ONLY at T=1.  It is
+# now caught 9/10; at T>=2 it is structurally impossible.  Earlier comments
+# here claimed a clean re-encode produces "~3 false positives per frame"
+# (measured: 0) and that a 32×32 region was caught at T=6 (it is not).
+MIN_TAMPER_BLOCKS = 1
+# Video's noise floor peaks at 3 blocks per frame, and `content_or_id_tamper`
+# fires on a SINGLE flagged frame, so anything below 4 reports a clean clip as
+# tampered. 5 measured best among the safe values.
+MIN_TAMPER_BLOCKS_VIDEO = 5
 
 # Raw owner_id / media_id are embedded directly (not as hashes) so that
 # verification can RESTORE the actual identifier strings under
@@ -209,7 +295,12 @@ def _decode_id_fixed(b: bytes) -> str:
     `errors='replace'` keeps decoding robust when a truncated multi-byte
     sequence remains at the tail (recovery still surfaces something
     rather than throwing)."""
-    return b.rstrip(b'\x00').decode('utf-8', errors='replace')
+    # Drop control characters, not just the trailing NUL padding. A failed
+    # recovery returns arbitrary bytes, and a NUL in the middle survives
+    # rstrip; Postgres then rejects the archived verdict with SQLSTATE 22P05
+    # and the whole history row is lost over a meaningless value.
+    decoded = b.rstrip(b'\x00').decode('utf-8', errors='replace')
+    return ''.join(ch for ch in decoded if ch.isprintable())
 
 
 def _owner_id_bits_array(owner_id: str) -> np.ndarray:
@@ -252,7 +343,7 @@ def _majority_vote(repeated_bits: np.ndarray, copy_len: int) -> Optional[np.ndar
 
 
 # ──────────────────────────────────────────────────────────────
-# CORE DCT → SVD → QIM (single subband, fixed 1 bit per 8x8 block)
+# CORE SVD → QIM (single subband, fixed 1 bit per 8x8 block)
 # ──────────────────────────────────────────────────────────────
 
 def _tile_blocks(subband: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
@@ -276,12 +367,12 @@ def _tile_blocks(subband: np.ndarray) -> Tuple[np.ndarray, int, int, int, int]:
     return blocks, nh, nw, H8, W8
 
 
-def _embed_bits_dct_svd(
+def _embed_bits_svd(
     subband: np.ndarray,
     bits: np.ndarray,
     qim_step: float,
 ) -> Tuple[np.ndarray, int]:
-    """Embed `bits` into 8x8 DCT→SVD blocks of `subband` via S[0] QIM.
+    """Embed `bits` into 8x8 SVD blocks of `subband` via S[0] QIM.
 
     Walks blocks row-major; exactly one bit per block — never skip a
     block, since embed/extract must iterate identical positions or the
@@ -294,11 +385,10 @@ def _embed_bits_dct_svd(
     "SVD ordering invariant".
 
     Implementation: tiles the subband into a (N, 8, 8) batch and runs a
-    single batched DCT + SVD over the whole subband instead of one
-    Python-level call per block.  Mathematically equivalent to the
-    sequential per-block code; the SVD-ordering guard is computed in
-    closed form (`q + 2*ceil(max(0, S1/step - q)/2)`) instead of being
-    iterated.
+    single batched SVD over the whole subband instead of one Python-level
+    call per block.  Mathematically equivalent to the sequential per-block
+    code; the SVD-ordering guard is computed in closed form
+    (`q + 2*ceil(max(0, S1/step - q)/2)`) instead of being iterated.
     """
     sub = subband.copy()
     blocks, nh, nw, H8, W8 = _tile_blocks(sub)
@@ -309,12 +399,8 @@ def _embed_bits_dct_svd(
 
     proc = blocks[:n_bits]
 
-    # Batched 2D orthonormal DCT — same axis order (row, col) as the
-    # original per-block call applied along axis=0 then axis=1.
-    dblocks = dct(dct(proc, axis=1, norm='ortho'), axis=2, norm='ortho')
-
     # Batched SVD — one LAPACK call covers every block.
-    U, S, Vt = np.linalg.svd(dblocks)
+    U, S, Vt = np.linalg.svd(proc)
 
     S0 = S[:, 0]
     S1 = S[:, 1]   # always present: 8x8 blocks → S has length 8
@@ -339,13 +425,8 @@ def _embed_bits_dct_svd(
     S_new = S.copy()
     S_new[:, 0] = q_final * qim_step
 
-    # Reconstruct DCT block: U @ diag(S) @ Vt == U @ (S[..., None] * Vt)
-    recon = np.matmul(U, S_new[..., None] * Vt)
-
-    # Inverse 2D DCT — reverse the axis order used in the forward pass.
-    iblocks = idct(idct(recon, axis=2, norm='ortho'), axis=1, norm='ortho')
-
-    blocks[:n_bits] = iblocks
+    # Rebuild the block: U @ diag(S) @ Vt == U @ (S[..., None] * Vt)
+    blocks[:n_bits] = np.matmul(U, S_new[..., None] * Vt)
 
     # Untile back to spatial layout.
     sub[:H8, :W8] = (blocks
@@ -355,14 +436,14 @@ def _embed_bits_dct_svd(
     return sub, n_bits
 
 
-def _extract_bits_dct_svd_with_mask(
+def _extract_bits_svd_with_mask(
     subband: np.ndarray,
     n_bits: int,
     qim_step: float,
 ) -> Tuple[np.ndarray, List[Tuple[int, int]]]:
     """Extract up to n_bits bits, one per 8x8 block in the same row-major
-    order used by `_embed_bits_dct_svd`.  Batched DCT + SVD; semantics
-    identical to the per-block loop.
+    order used by `_embed_bits_svd`.  Batched SVD; semantics identical to
+    the per-block loop.
     """
     blocks, _, nw, _, _ = _tile_blocks(subband)
     total_blocks = blocks.shape[0]
@@ -371,8 +452,7 @@ def _extract_bits_dct_svd_with_mask(
         return np.zeros(0, dtype=np.uint8), []
 
     proc = blocks[:n_extract]
-    dblocks = dct(dct(proc, axis=1, norm='ortho'), axis=2, norm='ortho')
-    _, S, _ = np.linalg.svd(dblocks)
+    _, S, _ = np.linalg.svd(proc)
 
     bits = (np.round(S[:, 0] / qim_step).astype(np.int64) % 2).astype(np.uint8)
 
@@ -388,7 +468,7 @@ def _extract_bits_dct_svd_with_mask(
 # ──────────────────────────────────────────────────────────────
 # Encodes a target parity bit in the LSB of each 16×16 sub-block's mean
 # (block-mean QIM with step Q=2, see LSB_SUB_BLOCK_SIZE).  Aggregated to the
-# same 32×32 spatial grid as the DCT/SVD fingerprint map, so the two maps can
+# same 32×32 spatial grid as the SVD fingerprint map, so the two maps can
 # be ANDed for compression-robust tamper localisation.
 
 def _compute_lsb_target_pattern(
@@ -427,9 +507,17 @@ def _embed_lsb_sub_block_parity(
     """Adjust Y so each 16×16 sub-block's mean encodes the target LSB parity.
 
     Per sub-block: shift the mean to the nearest multiple of q whose
-    parity matches the target bit.  The shift is applied uniformly to
-    all 256 pixels of the sub-block, so each pixel moves by at most q/2.
-    With q=2 this is ≤1 grey-level → ≥48 dB local PSNR.
+    parity matches the target bit.  The shift is applied uniformly to all
+    256 pixels of the sub-block, so every pixel moves by the same amount.
+
+    That amount is at most q/2 when the parity is ALREADY correct (snap to
+    the nearest level), but up to q when it must flip — the nearest level
+    of the opposite parity is a whole step away.  Measured worst case:
+    2.00 for q=2, 3.00 for q=3.  (An earlier version of this docstring
+    claimed q/2 as the overall bound; that is the no-flip case only.)
+
+    With q=3, measured whole-image PSNR 42.0 dB
+    (q=2 gave 44.3 dB, but is blind to negation — see LSB_QIM_STEP).
 
     `sub_block` defaults to LSB_SUB_BLOCK_SIZE; the sizes quoted above follow
     from that constant rather than being independent facts.
@@ -514,18 +602,19 @@ def _embed_lsb_chroma(
     Cb: np.ndarray,
     signature: bytes,
     frame_id: int,
+    q: float = LSB_QIM_STEP,
 ) -> np.ndarray:
     """Embed the LSB block-mean parity layer into a Cb chroma channel.
 
     Chroma is used (not luminance) so the layer is fully orthogonal to
-    the DCT/SVD watermark in Y — they cannot disturb each other.  The
+    the SVD watermark in Y — they cannot disturb each other.  The
     spatial-map signal it produces is independent of, and complementary
-    to, the DCT/SVD fingerprint map.
+    to, the SVD fingerprint map.
     """
     n_sub_h = Cb.shape[0] //LSB_SUB_BLOCK_SIZE
     n_sub_w = Cb.shape[1] //LSB_SUB_BLOCK_SIZE
     pattern = _compute_lsb_target_pattern(n_sub_h, n_sub_w, signature, frame_id)
-    return _embed_lsb_sub_block_parity(Cb, pattern)
+    return _embed_lsb_sub_block_parity(Cb, pattern, q=q)
 
 
 def _verify_lsb_chroma(
@@ -533,17 +622,18 @@ def _verify_lsb_chroma(
     signature: bytes,
     frame_id: int,
     target_shape: Optional[Tuple[int, int]] = None,
+    q: float = LSB_QIM_STEP,
 ) -> Dict:
     """Extract the LSB block-mean parity layer from a Cb chroma channel.
 
     If `target_shape` is given, the aggregated block map is cropped to
     match it — letting the caller AND the LSB map directly with the
-    DCT/SVD spatial map without size mismatches.
+    SVD spatial map without size mismatches.
     """
     n_sub_h = Cb.shape[0] // LSB_SUB_BLOCK_SIZE
     n_sub_w = Cb.shape[1] // LSB_SUB_BLOCK_SIZE
     pattern = _compute_lsb_target_pattern(n_sub_h, n_sub_w, signature, frame_id)
-    sub_mismatch = _verify_lsb_sub_block_parity(Cb, pattern)
+    sub_mismatch = _verify_lsb_sub_block_parity(Cb, pattern, q=q)
     block_map = _aggregate_lsb_to_block_map(sub_mismatch)
     # The pattern actually extracted from the (possibly tampered) chroma is the
     # expected target XOR the per-sub-block mismatch — wherever they disagree,
@@ -647,17 +737,17 @@ def _embed_into_channel(
     # Each subband-embed returns the number of bits it consumed; we
     # cascade the remainder into the next subband.
     cursor = 0
-    LLLL, n_in_llll = _embed_bits_dct_svd(LLLL, full_stream[cursor:], QIM_STEP_ROBUST)
+    LLLL, n_in_llll = _embed_bits_svd(LLLL, full_stream[cursor:], QIM_STEP_ROBUST)
     cursor += n_in_llll
 
     n_in_llh = 0
     if cursor < len(full_stream):
-        LLLH, n_in_llh = _embed_bits_dct_svd(LLLH, full_stream[cursor:], QIM_STEP_ROBUST)
+        LLLH, n_in_llh = _embed_bits_svd(LLLH, full_stream[cursor:], QIM_STEP_ROBUST)
         cursor += n_in_llh
 
     n_in_lhl = 0
     if cursor < len(full_stream):
-        LLHL, n_in_lhl = _embed_bits_dct_svd(LLHL, full_stream[cursor:], QIM_STEP_ROBUST)
+        LLHL, n_in_lhl = _embed_bits_svd(LLHL, full_stream[cursor:], QIM_STEP_ROBUST)
         cursor += n_in_lhl
 
     n_embedded = cursor
@@ -707,7 +797,7 @@ def _verify_channel(
     for sub in (LLLL, LLLH, LLHL):
         if remaining <= 0:
             break
-        bits, _ = _extract_bits_dct_svd_with_mask(sub, remaining, QIM_STEP_ROBUST)
+        bits, _ = _extract_bits_svd_with_mask(sub, remaining, QIM_STEP_ROBUST)
         parts.append(bits)
         remaining -= len(bits)
 
@@ -909,6 +999,14 @@ def embed_image(
     if img_array.ndim < 3 or img_array.shape[2] < 3:
         raise ValueError("Input must be H×W×3 RGB.")
 
+    # Reserve headroom so no pixel sits on the edge of the range with nowhere
+    # to move.  See SATURATION_HEADROOM.  Applied to the SOURCE, so the value
+    # the decoder reads back is the one that was written.
+    if SATURATION_HEADROOM:
+        img_array = np.clip(img_array[:, :, :3],
+                            SATURATION_HEADROOM,
+                            255 - SATURATION_HEADROOM).astype(np.uint8)
+
     signature   = _master_signature(owner_id, media_id, frame_id)
     # Chain still keyed by media_id — kept as a SHA-256 derivation so the
     # chain_tag's secrecy properties are unchanged.  This is an internal
@@ -943,7 +1041,7 @@ def embed_image(
 
     Y_wm, info = _embed_into_channel(Y, meta_coded, signature, frame_id, extras)
 
-    # LSB layer on chroma — independent of Y's DCT/SVD watermark.
+    # LSB layer on chroma — independent of Y's SVD watermark.
     Cb_wm = _embed_lsb_chroma(Cb, signature, frame_id)
     if info["n_meta_bits"] < len(meta_coded):
         raise ValueError(
