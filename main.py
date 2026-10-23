@@ -1158,6 +1158,41 @@ def list_my_verifications(user: dict = Depends(get_current_user)):
     return {"items": res.data or []}
 
 
+@app.delete("/me/verifications/{check_id}")
+def delete_my_verification(check_id: str, user: dict = Depends(get_current_user)):
+    """Remove one entry from the caller's verification history.
+
+    Unlike deleting an encode record, this has no side effects: a history row
+    is only a summary of a past report, and nothing else reads it.  Scoped by
+    user_id so one account cannot delete another's row, and fetched first so a
+    missing id is a clean 404 rather than a silent no-op reported as success.
+    """
+    res = (
+        supabase.table("verifications")
+        .select("id")
+        .eq("id", check_id)
+        .eq("user_id", user["id"])
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        raise HTTPException(404, "Not found or not yours")
+
+    supabase.table("verifications").delete().eq("id", check_id).eq("user_id", user["id"]).execute()
+    return {"deleted": check_id}
+
+
+@app.delete("/me/verifications")
+def clear_my_verifications(user: dict = Depends(get_current_user)):
+    """Clear the caller's whole verification history.
+
+    Deletes every row for this user, not just the 100 the list endpoint shows,
+    so "clear" leaves nothing behind to reappear later.
+    """
+    res = supabase.table("verifications").delete().eq("user_id", user["id"]).execute()
+    return {"deleted": len(res.data or [])}
+
+
 @app.post("/verify")
 async def verify(
     file:     UploadFile = File(...),
