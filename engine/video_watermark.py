@@ -48,6 +48,7 @@ from watermark_engine import (
     FRAME_ID_BITS, CHAIN_TAG_BITS,
 
     BER_TAMPER_THRESHOLD, MIN_TAMPER_BLOCKS_VIDEO, LSB_QIM_STEP_VIDEO,
+    SATURATION_HEADROOM,
 )
 import struct
 
@@ -280,6 +281,16 @@ def embed_video(
 
         if frame_idx % embed_every_n_frames == 0:
             rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+
+            # Same headroom embed_image reserves, and needed for the same
+            # reason: a pixel at 0 or 255 has nowhere to move, so the chroma
+            # layer's shift is clipped away.  Without it a clip with large
+            # pure-white title text flagged a median of 10 blocks per frame
+            # on a clean round trip, past MIN_TAMPER_BLOCKS_VIDEO, and every
+            # frame came back tampered.  With it: 1.
+            if SATURATION_HEADROOM:
+                rgb = np.clip(rgb, SATURATION_HEADROOM,
+                              255 - SATURATION_HEADROOM).astype(np.uint8)
 
             signature   = _master_signature(owner_id, media_id, frame_idx)
 
@@ -699,11 +710,8 @@ def verify_video(
     # totals to catch it.
     observed_total_frames = frame_idx
     expected_total_frames = int(metadata.get("total_frames") or 0)
-    frames_truncated      = max(0, expected_total_frames - observed_total_frames)
-    # Tolerate up to 2 frames of difference: audio muxing can shift MKV
-    # container metadata so cv2 reads slightly fewer frames than were
-    # written.  Real truncation attacks remove many more frames.
-    truncated             = bool(expected_total_frames > 0 and frames_truncated > 2)
+    # frames_truncated / truncated are settled below, once the recovered
+    # frame ids are known.
 
     spatial_arr  = np.stack(spatial_maps, axis=0) if spatial_maps else np.empty((0, 0, 0), bool)
     temporal_arr = np.array(temporal_map, dtype=bool)
@@ -726,6 +734,21 @@ def verify_video(
     # Frame_ids that were embedded but never showed up → deleted (or, under
     # heavy compression, unrecoverable).  This is the localized deletion list.
     missing_frame_ids = [int(f) for f in embedded_indices if f not in recovered_set]
+
+    # Truncation is frames missing from the END: ids past the last one still
+    # present.  It used to be expected minus observed frame count, which also
+    # counted frames cut from the MIDDLE, so a mid-clip deletion was reported
+    # as "truncated from the end" too.  With no id recovered at all there is
+    # no "last" frame to measure from, so fall back to the count difference.
+    if recovered_set:
+        last_present     = max(recovered_set)
+        frames_truncated = sum(1 for f in missing_frame_ids if f > last_present)
+    else:
+        frames_truncated = max(0, expected_total_frames - observed_total_frames)
+    # Tolerate up to 2 frames: audio muxing can shift MKV container metadata
+    # so cv2 reads slightly fewer frames than were written.  Real truncation
+    # attacks remove many more.
+    truncated = bool(expected_total_frames > 0 and frames_truncated > 2)
 
     # Expected fragile-watermark pattern for each deleted frame_id, so the
     # frontend can still show its "original" watermark next to a "frame
