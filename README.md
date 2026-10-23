@@ -129,10 +129,133 @@ video is ~22 MB, so a 1 GB free tier holds roughly 45 of them.
 
 Downstream re-encoding to a lossy format is correctly flagged as tampered — that is the algorithm working as designed.
 
+## Screenshots and rescaled copies
+
+A screenshot of a watermarked image used to fail verification completely — not
+because the watermark was gone, but because it was no longer being read from
+where it was written. The decoder reads fixed 32×32 pixel tiles; a screenshot
+moves that grid two ways at once:
+
+- **scale** — the image on screen is almost never 1:1 with its own pixels
+  (display DPI scaling, browser zoom, fit-to-container)
+- **offset** — the capture rectangle does not start on a multiple of 32
+
+Measured, a **one pixel** crop was already enough to destroy every extracted
+bit. [`engine/resync.py`](engine/resync.py) recovers from both by searching for
+the transform that puts the grid back, then re-running the ordinary extraction.
+Nothing about embedding changed, so existing watermarked files stay valid and
+the eval numbers above are unaffected.
+
+It runs **only after normal extraction has failed**. On `/verify` the
+`width`/`height` now stored in metadata collapse the whole realistic screenshot
+space to one 64-candidate offset scan, and the best agreement wins rather than
+the first candidate over the threshold — a near-miss accepted greedily verifies
+worse than the exact geometry it was standing next to.
+
+On `/lookup` it runs later still: only once the database has come back empty, so
+a merely recompressed file resolves through the normal path and never pays for a
+search. There is deliberately no cheap "has the grid moved?" pre-test. One was
+built and measured, and it does not work — an aligned frame scored as low as
+**0.35x** its own wrong-phase null while a 2x upscale reached **4.39x**, because
+an integer upscale leaves every other block boundary still on the grid. The two
+populations overlap completely, so the search itself is the only honest test.
+
+### It cannot return a wrong owner
+
+The search tries thousands of geometries, so its accept test carries the
+weight. Every candidate goes through the payload's 2-byte SHA-256 integrity
+tag, and nothing else is allowed to confirm a hit — in particular the
+majority-vote fallback is deliberately unreachable from the search, because it
+has no such tag and on a misaligned image returns the *media* id in the owner
+slot. Measured over 8 never-watermarked photos: 11,874 candidate geometries
+scored, 372 decoded, **0 accepted**.
+
+### What it recovers
+
+Across the eval corpus, matched against what is even theoretically recoverable
+(i.e. what still decodes when handed its exact true geometry):
+
+| screenshot | recovered | typical time |
+|---|---|---|
+| crop ≤ 8px | **8/8** | 0.04 – 6.2 s |
+| DPI 125% / 150% / 200% | **7/8** | 1.8 – 4.8 s |
+| fit-to-container 0.8x | **7/8** | 1.7 – 4.4 s |
+| rescaled **and** cropped | **7/8** | 1.8 – 4.8 s |
+
+The search reaches the ceiling in every case: the one image it misses does not
+decode even when handed its exact true geometry, so nothing could have
+recovered it. That is a robustness limit of the watermark, not of the search —
+fine detail shifts the LL-family singular values past what QIM can hold.
+
+**Robustness here is content-dependent, and that matters more than the table
+suggests.** A heavily textured photograph carries a much weaker watermark: one
+1280×959 landscape encoded by this service fails JPEG q95 and sigma=2 noise
+outright, so its owner ID cannot be read back from a screenshot no matter how
+perfectly the geometry is restored. Its media ID still comes back. Run
+[`diagnose_screenshot.py`](diagnose_screenshot.py) on a file to see which limit
+it hit.
+
+Out of range by construction:
+
+- downscaling past ~0.6x — the QIM lattice itself is gone, measured no decode
+  even at the true geometry
+- crops larger than 8px — those blocks are lost, and only the unvalidated vote
+  path could guess them
+- distortions that are not scale-plus-crop — rotation, perspective, or an
+  aspect ratio that changed
+
+### Captures that caught the page around the image
+
+A real screenshot is rarely cropped to the pixel; it carries a strip of window
+chrome or page background. That strip is not a crop the offset scan can undo —
+the content becomes a sub-rectangle, so every block index *and the row stride
+itself* are wrong. Measured, a **2 pixel** border was enough to turn a clean
+recovery into no match at all.
+
+`/verify` now locates the content rectangle (scanning in from each edge while
+the row stays flat) and scans inside it as well, keeping whichever of the two
+fits better. Both are always tried, rather than trimming only when the first
+attempt comes back empty — a framed upload does not come back empty, it comes
+back with a near-miss that clears the threshold. On that 2px border the
+untrimmed scan offered 0.945 and the trimmed one was exact; stopping at the
+first acceptable answer took the worse of the two.
+
+Measured on a 2000×2509 encode displayed at 1594×2000, borders of 1, 2, 12 and
+40px all recover both ids exactly.
+
+### Why the scan is fast
+
+Restoring a whole 2000×2509 frame to read a payload that lives in its first
+block rows cost 481 ms per candidate, which made a 64-candidate scan take 25
+seconds. Only the strip the payload occupies is restored now — Haar has no
+overlap beyond its 4×4 level-2 support, so those block rows decompose
+identically to the same rows of the full image. The same scan is **0.7 s**.
+
+A note on the ranking signal, because it is the part most likely to mislead
+someone extending this: `lattice_score` is what makes the *blind* sweep
+affordable, but it measures whether the QIM lattice survived — not whether the
+payload can be read. Those diverge. On a 2000×2509 image downscaled to 1594px
+the true geometry ranked **1760th of 2154** by lattice score while decoding
+perfectly, because resampling scatters S[0] without flipping the parity that
+carries the bit. Verification does not rank by it at all: with the dimensions
+known it scans offsets directly and scores each by how far the recovered bits
+agree with the ids it already holds, which measures the right thing.
+
+### It restores geometry, not the verdict
+
+A recovered screenshot still reports honestly. Resampling is a real
+modification, so the file may still come back `tampered` — what changes is that
+the report names the actual reason instead of claiming the owner ID could not
+be matched, which is indistinguishable from a forgery and the wrong thing to
+tell someone about their own file. When a restoration happened, the response
+carries a `resynced` object (`width`, `height`, `offsetX`, `offsetY`) and leads
+the `reasons` list with a plain-language note.
+
 ## Watermark engine (in `engine/`)
 
 - [`watermark_engine.py`](engine/watermark_engine.py) — image path. Embeds bits with LWT + 8×8 DCT + SVD + QIM on the Y channel; BCH(15,7) error-correction on the payload; per-sub-block SHA-256 parity in Cb LSBs for spatial tamper localization.
 - [`video_watermark.py`](engine/video_watermark.py) — per-frame embed with frame-ID + chain-tag bits so deletions, duplicates, and reorders surface as discrete temporal events instead of cascading errors.
+- [`resync.py`](engine/resync.py) — decode-side only. Finds the geometry of a rescaled or cropped copy so the other two can read it; see [Screenshots and rescaled copies](#screenshots-and-rescaled-copies).
 
 Constants exposed by the engine (`OWNER_ID_BITS`, `MEDIA_ID_BITS`, `FRAME_ID_BITS`, `CHAIN_TAG_BITS`, `SPATIAL_BLOCK`, `META_PAYLOAD_BYTES`, BCH `_BCH_N` / `_BCH_K`) are imported by `main.py` to keep encode-side and verify-side in lockstep.
 

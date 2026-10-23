@@ -14,6 +14,7 @@ Endpoints:
 """
 
 import sys
+import time
 import os
 import io
 import re
@@ -44,15 +45,18 @@ sys.path.insert(0, str(ENGINE_DIR))
 from watermark_engine import (
     embed_image, verify_image, SPATIAL_BLOCK, LSB_SUB_BLOCK_SIZE,
     _verify_channel, _parse_meta_payload,
-    bch_decode_bits, array_to_bytes,
+    bch_decode_bits, array_to_bytes, bits_to_array,
     to_float_ycbcr, META_PAYLOAD_BYTES,
     _BCH_N, _BCH_K,
     _majority_vote, _decode_id_fixed, _encode_id_fixed,
+    _llfamily_block_capacity, _plan_repeat_copies,
     OWNER_ID_BITS, MEDIA_ID_BITS, FRAME_ID_BITS, CHAIN_TAG_BITS,
     OWNER_ID_BYTES, MEDIA_ID_BYTES,
     OWNER_REPEATS, MEDIA_REPEATS, FRAME_REPEATS, CHAIN_REPEATS,
 )
 from video_watermark import embed_video, verify_video
+from resync import (resync_extract, apply_transform, content_box,
+                    MAX_OFFSET as RESYNC_MAX_OFFSET)
 
 import httpx
 
@@ -931,14 +935,28 @@ def get_metadata(file_id: str):
     return res.data[0]["metadata"]
 
 
-def _blind_extract_ids(img_array: np.ndarray) -> dict | None:
-    """Extract owner_id and media_id from a watermarked image without metadata.
+# An unwatermarked upload looks exactly like a misaligned one until the search
+# has finished failing — the search is what tells them apart — so this bounds
+# what that costs.  Sized at roughly twice the slowest recovery measured end to
+# end (5.4s, a fit-to-container rescale, which is the case that has to reach
+# the exhaustive scale sweep) to leave headroom on a slower box.
+RESYNC_BUDGET_S = 12.0
 
-    Tries BCH decode first (works on lossless files).  When compression
-    corrupts BCH, falls back to majority-vote on the repetition copies —
-    the same recovery path that verify_image uses.
+
+def _bch_extract_ids(img_array: np.ndarray) -> dict | None:
+    """Extract the payload via BCH alone, gated on its integrity tag.
+
+    Split out from `_blind_extract_ids` because this is the only form safe to
+    hand to a geometry search: `_parse_meta_payload` rejects anything whose
+    SHA-256 tag does not match, so a wrong transform returns None rather than a
+    confident wrong owner.  The majority-vote path below has no such tag, and
+    on a misaligned image its sections are themselves shifted — measured
+    returning the media id in the owner slot.  Searching with it would
+    eventually confirm a wrong geometry.
     """
     if img_array.ndim < 3 or img_array.shape[2] < 3:
+        return None
+    if img_array.shape[0] < 64 or img_array.shape[1] < 64:
         return None
 
     Y, _, _ = to_float_ycbcr(img_array[:, :, :3])
@@ -947,38 +965,67 @@ def _blind_extract_ids(img_array: np.ndarray) -> dict | None:
     meta_padded   = ((_BCH_K - meta_raw_bits % _BCH_K) % _BCH_K) + meta_raw_bits
     n_meta_coded  = (meta_padded // _BCH_K) * _BCH_N               # 420
 
-    # Compute how many extra repetition bits the subbands can hold.
-    H, W = Y.shape
-    h2, w2 = H // 4, W // 4
-    blocks_per_sub = (h2 // 8) * (w2 // 8)
-    total_capacity = blocks_per_sub * 3                             # LLLL+LLLH+LLHL
-    max_extras = (FRAME_REPEATS * FRAME_ID_BITS +
-                  OWNER_REPEATS * OWNER_ID_BITS +
-                  MEDIA_REPEATS * MEDIA_ID_BITS +
-                  CHAIN_REPEATS * CHAIN_TAG_BITS)
-    n_extra = min(max(0, total_capacity - n_meta_coded), max_extras)
+    res = _verify_channel(Y, n_meta_coded, b"\x00" * 32, 0, n_extra_llll_bits=0)
+    decoded, _ = bch_decode_bits(res["meta_bits_coded"])
+    return _parse_meta_payload(array_to_bytes(decoded[:meta_raw_bits]))
+
+
+def _blind_extract_ids(img_array: np.ndarray,
+                       frame_repeats: int = 1) -> dict | None:
+    """Extract owner_id and media_id from a watermarked image without metadata.
+
+    Tries BCH decode first (works on lossless files), then falls back to
+    majority-vote on the repetition copies — the same recovery path
+    verify_image uses.  Both read the grid where it is; recovering a grid that
+    MOVED is `_resync_extract_ids`, which /lookup reaches for only once a
+    lookup on these ids has actually come back empty.
+
+    `frame_repeats` selects which encoder's layout to read back, and it has to
+    match: `embed_image` writes a single frame_id copy (a still image's frame
+    is always 0 and the BCH meta already carries it, so the space goes to the
+    provenance ids instead), while `embed_video` writes FRAME_REPEATS of them.
+    """
+    if img_array.ndim < 3 or img_array.shape[2] < 3:
+        return None
+
+    parsed = _bch_extract_ids(img_array)
+    if parsed:
+        return parsed
+
+    Y, _, _ = to_float_ycbcr(img_array[:, :, :3])
+
+    meta_raw_bits = META_PAYLOAD_BYTES * 8                          # 192
+    meta_padded   = ((_BCH_K - meta_raw_bits % _BCH_K) % _BCH_K) + meta_raw_bits
+    n_meta_coded  = (meta_padded // _BCH_K) * _BCH_N               # 420
+
+    # Rebuild the encoder's own repeat plan rather than assuming the maxima.
+    # The copies that fit depend on the image's capacity, so the section
+    # boundaries move with it — and reading them at fixed offsets silently
+    # lands mid-section.  This was wrong for every still image: embed_image
+    # writes ONE frame_id copy, so skipping FRAME_REPEATS (5) of them
+    # overshoots by 128 bits and starts reading inside the owner section,
+    # which is why blind lookup returned the media id in the owner slot.
+    n_frame_copies, n_owner_copies, n_media_copies, n_chain_copies = \
+        _plan_repeat_copies(_llfamily_block_capacity(Y.shape) - n_meta_coded,
+                            frame_repeats=frame_repeats)
+    n_extra = (n_frame_copies * FRAME_ID_BITS +
+               n_owner_copies * OWNER_ID_BITS +
+               n_media_copies * MEDIA_ID_BITS +
+               n_chain_copies * CHAIN_TAG_BITS)
 
     res = _verify_channel(Y, n_meta_coded, b"\x00" * 32, 0,
                           n_extra_llll_bits=n_extra)
 
-    # ── Try 1: BCH decode ──
-    decoded, _ = bch_decode_bits(res["meta_bits_coded"])
-    meta_bytes = array_to_bytes(decoded[:meta_raw_bits])
-    parsed = _parse_meta_payload(meta_bytes)
-    if parsed:
-        return parsed
-
-    # ── Try 2: majority-vote fallback on repetition copies ──
-    # Layout matches embed order: frame(5x) → owner(3x) → media(3x) → chain(3x)
+    # ── Try 3: majority-vote fallback on repetition copies ──
+    # Layout matches embed order: frame → owner → media → chain.
     extra = res["extra_llll_bits"]
-    p = 0
-    p += min(FRAME_REPEATS * FRAME_ID_BITS, len(extra))            # skip frame_id
+    p = min(n_frame_copies * FRAME_ID_BITS, len(extra))             # skip frame_id
 
-    n_owner = min(OWNER_REPEATS * OWNER_ID_BITS, max(0, len(extra) - p))
+    n_owner = min(n_owner_copies * OWNER_ID_BITS, max(0, len(extra) - p))
     owner_section = extra[p:p + n_owner]
     p += n_owner
 
-    n_media = min(MEDIA_REPEATS * MEDIA_ID_BITS, max(0, len(extra) - p))
+    n_media = min(n_media_copies * MEDIA_ID_BITS, max(0, len(extra) - p))
     media_section = extra[p:p + n_media]
 
     owner_voted = (_majority_vote(owner_section, OWNER_ID_BITS)
@@ -998,6 +1045,27 @@ def _blind_extract_ids(img_array: np.ndarray) -> dict | None:
         return None
 
     return {"owner_id": owner_str, "media_id": media_str}
+
+
+def _resync_extract_ids(img_array: np.ndarray) -> dict | None:
+    """Find the ids in a copy whose pixel grid moved — a screenshot, usually.
+
+    Kept apart from `_blind_extract_ids`, and reached only after a lookup on
+    that function's answer has come back empty, because there is no cheap test
+    for "the grid moved".  One was tried: score the image against its own
+    wrong-phase samples and search only when it fails to stand out.  Measured
+    across the corpus the two populations overlap completely — an aligned frame
+    scored as low as 0.35x its null while a 2x upscale reached 4.39x, because
+    an integer upscale leaves every other block boundary still on the grid.  No
+    threshold separates them, so the only honest test is the search itself.
+
+    Letting the database decide keeps that cost off the common path: a file
+    that was merely recompressed resolves through the vote path and never gets
+    here, and only a file nothing matches pays for the search.
+    """
+    recovered, _info = resync_extract(img_array, _bch_extract_ids,
+                                      time_budget=RESYNC_BUDGET_S)
+    return recovered
 
 
 @app.post("/lookup")
@@ -1028,7 +1096,9 @@ async def lookup(file: UploadFile = File(...)):
                 if not ret:
                     break
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                parsed = _blind_extract_ids(rgb)
+                # embed_video lays out FRAME_REPEATS frame_id copies, unlike
+                # the single copy embed_image writes — see _blind_extract_ids.
+                parsed = _blind_extract_ids(rgb, frame_repeats=FRAME_REPEATS)
                 if parsed:
                     break
             cap.release()
@@ -1060,6 +1130,22 @@ async def lookup(file: UploadFile = File(...)):
         .eq("media_key", media_key)
         .execute()
     )
+
+    if not res.data and kind == "image":
+        # Nothing matched, so the ids read out of the pixels are suspect — most
+        # often because the upload is a screenshot and the grid they came from
+        # has moved.  Search for the real geometry and ask once more.
+        retry = _resync_extract_ids(img)
+        if retry and (retry["owner_id"].lower(), retry["media_id"].lower())                 != (owner_key, media_key):
+            owner_id, media_id = retry["owner_id"], retry["media_id"]
+            owner_key, media_key = owner_id.lower(), media_id.lower()
+            res = (
+                supabase.table("watermarks")
+                .select("*")
+                .eq("owner_key", owner_key)
+                .eq("media_key", media_key)
+                .execute()
+            )
 
     if not res.data:
         raise HTTPException(
@@ -1193,6 +1279,225 @@ def clear_my_verifications(user: dict = Depends(get_current_user)):
     return {"deleted": len(res.data or [])}
 
 
+# Bit agreement against the expected ids that marks a candidate geometry as the
+# right one.  A wrong grid yields uncorrelated bits and lands near 0.5; the true
+# grid clears 0.9 even on content whose watermark is too damaged for BCH.  At
+# 0.75 over 128 bits a false accept is ~1e-8 per candidate, and it only decides
+# WHERE to read - verify_image still reports what it actually finds there.
+GEOMETRY_BIT_AGREEMENT = 0.75
+
+
+def _make_geometry_oracle(meta: dict):
+    """An oracle that finds the grid using what `/verify` already knows.
+
+    `_bch_extract_ids` is the right oracle for a blind lookup, where the
+    payload has to authenticate itself.  Verification is not blind: the caller
+    supplied the ids, so a candidate can be judged by how well the bits under
+    it agree with those — and that survives damage BCH cannot correct.  It is
+    also cheaper, since agreement needs no BCH decode at all (~2ms against
+    ~66ms), which matters across a search of thousands of candidates.
+
+    Self-validating for the same reason as the integrity tag: agreement this
+    high against a *specific* 128-bit expectation cannot arise from a grid that
+    is merely plausible.
+    """
+    exp = np.concatenate([
+        bits_to_array(_encode_id_fixed(meta["owner_id"], OWNER_ID_BYTES)),
+        bits_to_array(_encode_id_fixed(meta["media_id"], MEDIA_ID_BYTES)),
+    ]).astype(np.uint8)
+
+    n_frame = int(meta.get("frame_repeat_copies", 0))
+    n_owner = int(meta.get("owner_repeat_copies", 0))
+    n_media = int(meta.get("media_repeat_copies", 0))
+    n_chain = int(meta.get("chain_repeat_copies", 0))
+    n_extra = (n_frame * FRAME_ID_BITS + n_owner * OWNER_ID_BITS +
+               n_media * MEDIA_ID_BITS + n_chain * CHAIN_TAG_BITS)
+    n_meta_coded = int(meta["meta_bits_coded"])
+
+    if n_owner < 2 or n_media < 2:
+        return None          # too few copies to vote on; caller falls back
+
+    def rows_needed(width: int) -> int:
+        """Pixel rows the payload spans at this width, so the restore can stop
+        there.  One bit per 8x8 block of a level-2 subband is one bit per 32x32
+        pixel tile, and the reader fills LLLL row-major before spilling into
+        the next subband — so covering these rows covers the whole payload
+        without the spill ever happening."""
+        blocks_per_row = max(1, width // 32)
+        return -(-(n_meta_coded + n_extra) // blocks_per_row) * 32
+
+    def oracle(img: np.ndarray) -> dict | None:
+        if img.ndim < 3 or img.shape[2] < 3 or min(img.shape[:2]) < 64:
+            return None
+        Y, _, _ = to_float_ycbcr(img[:, :, :3])
+        res = _verify_channel(Y, n_meta_coded, b"\x00" * 32, 0,
+                              n_extra_llll_bits=n_extra)
+        extra = res["extra_llll_bits"]
+        if len(extra) < n_extra:
+            return None
+
+        p = n_frame * FRAME_ID_BITS
+        owner_voted = _majority_vote(extra[p:p + n_owner * OWNER_ID_BITS],
+                                     OWNER_ID_BITS)
+        p += n_owner * OWNER_ID_BITS
+        media_voted = _majority_vote(extra[p:p + n_media * MEDIA_ID_BITS],
+                                     MEDIA_ID_BITS)
+        if owner_voted is None or media_voted is None:
+            return None
+
+        got = np.concatenate([owner_voted, media_voted]).astype(np.uint8)
+        if got.size != exp.size:
+            return None
+        agreement = float(np.mean(got == exp))
+        return {"agreement": agreement} if agreement >= GEOMETRY_BIT_AGREEMENT else None
+
+    oracle.rows_needed = rows_needed          # type: ignore[attr-defined]
+    return oracle
+
+
+def _best_known_geometry(img: np.ndarray, oracle, known: tuple[int, int],
+                         deadline: float) -> dict | None:
+    """Scan crop offsets at the known original size; return the best fit.
+
+    A screenshot of a file we hold metadata for has only two unknowns left, and
+    one of them is answered: the size is on record, so what remains is the
+    phase the capture rectangle started on.  That is a 64-candidate scan, small
+    enough to evaluate exhaustively and take the maximum rather than settle for
+    the first candidate over the threshold — near-misses clear the threshold
+    too, and verify worse than the exact geometry sitting beside them.
+
+    Only the strip the payload occupies is restored per candidate.  Restoring
+    the whole frame measured 481ms on a 2000x2509 upload, which turned this
+    scan into 25 seconds; the strip is the same arithmetic on a fraction of the
+    pixels.
+    """
+    rows = getattr(oracle, "rows_needed", None)
+    max_rows = rows(known[0]) if rows else None
+
+    best: dict | None = None
+    best_agreement = 0.0
+    for dy in range(RESYNC_MAX_OFFSET):
+        for dx in range(RESYNC_MAX_OFFSET):
+            if time.monotonic() > deadline:
+                return best
+            cand = {"width": known[0], "height": known[1], "dy": dy, "dx": dx}
+            got = oracle(apply_transform(img, cand, max_rows=max_rows))
+            if got and got["agreement"] > best_agreement:
+                best_agreement = got["agreement"]
+                best = dict(cand, score=round(got["agreement"], 4))
+                if best_agreement >= 1.0:
+                    return best          # exact; nothing can beat it
+    return best
+
+
+def _verify_image_resynced(img: np.ndarray, meta: dict) -> tuple[dict, dict | None]:
+    """`verify_image`, but recovering first if the copy was rescaled or cropped.
+
+    Verification reads the watermark from fixed block positions, so a copy
+    whose pixel grid moved — a screenshot, most often — fails every field at
+    once: not because the watermark is gone, but because it is no longer being
+    read from where it was written.  Reported plainly that comes out as "the
+    owner ID could not be matched", which is indistinguishable from a genuine
+    forgery and is the wrong thing to tell someone about their own file.
+
+    So when nothing matches AND the grid looks displaced, the geometry is
+    searched for and verification is re-run on the restored image.
+
+    The search is driven by the cheap BCH oracle rather than by `verify_image`
+    itself: the oracle costs ~66ms against a full verification's chroma
+    analysis, and the search may try hundreds of candidates before it lands.
+    Only the winner is verified properly.
+
+    Note what this does NOT do: it restores geometry, never the verdict.  A
+    resampled image has lost the fragile chroma layer, so it can still come
+    back tampered — correctly, since it genuinely is a re-encoded copy.  What
+    changes is that the report now names the real reason instead of blaming the
+    owner ID.
+    """
+    verdict = verify_image(img, meta)
+    if verdict.get("owner_match") or verdict.get("media_match"):
+        return verdict, None                      # grid was where we expected
+
+    if img.ndim < 3 or img.shape[2] < 3:
+        return verdict, None
+
+    # No gate here on whether the grid "looks" displaced: the cheap test for
+    # that does not work.  See `_resync_extract_ids` — an aligned frame and a
+    # 2x upscale land in the same range, so the search is the only real test.
+    # It stays bounded instead: `_best_known_geometry` is a fixed 64-candidate
+    # scan whenever the metadata records the original size.
+
+    # Metadata written since the dimensions were added turns the scale search
+    # into a single candidate; older metadata just falls back to searching.
+    known = None
+    if meta.get("width") and meta.get("height"):
+        known = (int(meta["width"]), int(meta["height"]))
+
+    # The agreement oracle reads the grid through damage that defeats BCH,
+    # which is the difference between recovering a heavily textured photo and
+    # not.  It needs the repeat-count fields, so metadata predating them falls
+    # back to BCH.
+    oracle = _make_geometry_oracle(meta)
+
+    # One deadline for the whole recovery, shared by every stage below.  The
+    # known-size scan and the fallback search used to receive RESYNC_BUDGET_S
+    # each, so an upload that matched nothing paid for both: measured 14-19s
+    # against the 12s this constant claims.  That is precisely the path an
+    # unwatermarked upload takes on a public endpoint, so it is the one that
+    # most needs a real bound.
+    deadline = time.monotonic() + RESYNC_BUDGET_S
+
+    # With the original dimensions known, the entire realistic screenshot space
+    # — rescaled, cropped, or both — collapses to one scan over the offsets, so
+    # scan it directly and take the BEST agreement rather than the first one
+    # over the line.  That distinction matters: the oracle accepts a merely
+    # good geometry, and a near-miss accepted greedily verifies worse than the
+    # exact one it was standing in front of.  Measured, greedy acceptance
+    # turned a 3px crop that had matched both ids into a match on neither.
+    if oracle and known:
+        best_src, best = img, _best_known_geometry(img, oracle, known, deadline)
+
+        # A real screenshot usually caught some of the page around the image,
+        # and that is not a crop the offset scan can undo — the content is a
+        # sub-rectangle, so the row stride itself is wrong.  Scan inside the
+        # content rectangle too, and keep whichever fits better.
+        #
+        # Both are scanned, rather than trimming only when the first attempt
+        # comes back empty, because a framed upload does not come back empty:
+        # it comes back with a near-miss that clears the threshold.  Measured
+        # on a 2px border, the untrimmed scan offered 0.945 and the trimmed one
+        # was exact, so stopping at the first acceptable answer took the worse
+        # of the two and matched neither id.
+        if not best or best["score"] < 1.0:
+            box = content_box(img)
+            if box:
+                top, bottom, left, right = box
+                inner = img[top:bottom, left:right]
+                alt = _best_known_geometry(inner, oracle, known, deadline)
+                if alt and (not best or alt["score"] > best["score"]):
+                    best_src = inner
+                    best = dict(alt, trimmed=[left, top, right, bottom])
+
+        if best:
+            return verify_image(apply_transform(best_src, best), meta), best
+
+    # Whatever the known-size scan left.  Nothing left means the answer is
+    # already in: the scan exhausted the budget without a fit.
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        return verdict, None
+
+    found, info = resync_extract(
+        img, oracle or _bch_extract_ids, known_dims=known,
+        time_budget=remaining)
+    transform = info.get("transform")
+    if not found or not transform:
+        return verdict, None
+
+    restored = apply_transform(img, transform)
+    return verify_image(restored, meta), transform
+
+
 @app.post("/verify")
 async def verify(
     file:     UploadFile = File(...),
@@ -1219,8 +1524,9 @@ async def verify(
         if kind == "image":
             img        = np.array(Image.open(in_path).convert("RGB"))
             img_h, img_w = img.shape[:2]
-            verdict    = verify_image(img, meta)
-            resp       = _shape_image_response(verdict, file.filename, img_w, img_h)
+            verdict, resync_info = _verify_image_resynced(img, meta)
+            resp       = _shape_image_response(verdict, file.filename, img_w, img_h,
+                                               resync_info)
         else:
             verdict = verify_video(str(in_path), meta, sample_frames=None)
             resp    = _shape_video_response(verdict, file.filename)
@@ -1256,13 +1562,49 @@ def _tamper_reasons(v: dict) -> list:
     return reasons
 
 
-def _shape_image_response(v: dict, filename: str, width: int, height: int) -> dict:
+def _resync_reason(resync: dict, width: int, height: int) -> str:
+    """Describe, in the user's terms, what had to be undone to read the file."""
+    parts = []
+    if (int(resync["width"]), int(resync["height"])) != (int(width), int(height)):
+        parts.append(f"rescaled from {width}x{height} to "
+                     f"{int(resync['width'])}x{int(resync['height'])}")
+    if resync.get("dx") or resync.get("dy"):
+        parts.append(f"cropped by {int(resync['dx'])}px left, "
+                     f"{int(resync['dy'])}px top")
+    what = " and ".join(parts) if parts else "geometrically altered"
+    return (f"this copy was {what} - typical of a screenshot; "
+            "the watermark was read after restoring the original geometry")
+
+
+def _shape_image_response(v: dict, filename: str, width: int, height: int,
+                          resync: dict | None = None) -> dict:
     # A genuine bit error rate: the fraction of fragile-watermark parity bits
     # that flipped.  The old `ber` was `spatial.mean()` — the fraction of
     # flagged 32x32 BLOCKS — which is a localisation ratio, not a bit rate, and
     # was mislabelled "Bit Error Rate" in the UI.  Both are reported now, each
     # under its own name.
     ber_bits = float(v.get("ber_lsb_sub", v.get("ber", 0.0)))
+
+    # `spatial_map` (and the watermark comparison grids) were computed on
+    # whichever image `verify_image()` actually ran on: the geometrically
+    # restored image when resync fired, the raw upload otherwise. Report
+    # THAT size as imageWidth/imageHeight so the frontend's percentage-based
+    # overlay lines up with the map that produced it, instead of always the
+    # raw upload's dimensions (which can differ after a screenshot's scale
+    # or crop was undone). Mirrors how the video path derives its dims
+    # straight from spatial_tamper_map's shape, below.
+    map_width, map_height = (
+        (int(resync["width"]), int(resync["height"])) if resync else (width, height)
+    )
+
+    reasons = _tamper_reasons(v) if v["tampered"] else []
+    if resync:
+        # Say this first.  Everything else in the report describes a file that
+        # had to be geometrically restored before it could be read at all, and
+        # without that context a "tampered" verdict on someone's own screenshot
+        # reads as an accusation rather than as a description of resampling.
+        reasons.insert(0, _resync_reason(resync, width, height))
+
     return {
         "status":          "tampered" if v["tampered"] else "authentic",
         # Measured, not synthesised: what fraction of the fragile watermark's
@@ -1270,11 +1612,18 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int) -> di
         "wmAccuracy":      max(0.0, min(1.0, 1.0 - ber_bits)),
         "ber":             ber_bits,
         "blockFlagRatio":  float(v["ber"]),
-        "reasons":         _tamper_reasons(v) if v["tampered"] else [],
+        "reasons":         reasons,
+        # Present only when the upload's pixel grid had to be restored before
+        # the watermark could be read — the UI can use it to explain why a
+        # screenshot verifies at all, and why it may still read as modified.
+        "resynced":        ({"width":  int(resync["width"]),
+                             "height": int(resync["height"]),
+                             "offsetX": int(resync["dx"]),
+                             "offsetY": int(resync["dy"])} if resync else None),
         "fileType":        "image",
         "fileName":        filename,
-        "imageWidth":      int(width),
-        "imageHeight":     int(height),
+        "imageWidth":      int(map_width),
+        "imageHeight":     int(map_height),
         # Only surface flagged regions on a real content edit — below the
         # MIN_TAMPER_BLOCKS floor the flagged blocks are quantization noise, so
         # we report none (consistent with the clean watermark comparison).

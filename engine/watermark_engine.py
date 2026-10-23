@@ -1070,6 +1070,14 @@ def embed_image(
         "owner_id":            owner_id,
         "media_id":            media_id,
         "frame_id":            frame_id,
+        # Dimensions at embed time.  The block grid is anchored to them, so a
+        # copy that was rescaled on the way back — a screenshot, most often —
+        # can be restored to the geometry the decoder expects instead of having
+        # its scale searched for.  See engine/resync.py.  Optional on read:
+        # metadata written before this field existed simply falls back to the
+        # blind search.
+        "width":               int(img_array.shape[1]),
+        "height":              int(img_array.shape[0]),
         "meta_bits_raw":       int(len(meta_bits)),
         "meta_bits_coded":     int(len(meta_coded)),
         "frame_repeat_bits":     int(n_frame_bits),
