@@ -988,9 +988,12 @@ def _blind_extract_ids(img_array: np.ndarray,
     if img_array.ndim < 3 or img_array.shape[2] < 3:
         return None
 
+    # `checked` says whether the ids authenticated themselves (BCH + integrity
+    # tag) or are an unchecked vote, so /lookup knows whether it may quote them
+    # back to the user as "read from the watermark".
     parsed = _bch_extract_ids(img_array)
     if parsed:
-        return parsed
+        return dict(parsed, checked=True)
 
     Y, _, _ = to_float_ycbcr(img_array[:, :, :3])
 
@@ -1044,10 +1047,11 @@ def _blind_extract_ids(img_array: np.ndarray,
     if not owner_str and not media_str:
         return None
 
-    return {"owner_id": owner_str, "media_id": media_str}
+    return {"owner_id": owner_str, "media_id": media_str, "checked": False}
 
 
-def _resync_extract_ids(img_array: np.ndarray) -> dict | None:
+def _resync_extract_ids(img_array: np.ndarray,
+                        time_budget: float = RESYNC_BUDGET_S) -> dict | None:
     """Find the ids in a copy whose pixel grid moved — a screenshot, usually.
 
     Kept apart from `_blind_extract_ids`, and reached only after a lookup on
@@ -1064,8 +1068,85 @@ def _resync_extract_ids(img_array: np.ndarray) -> dict | None:
     here, and only a file nothing matches pays for the search.
     """
     recovered, _info = resync_extract(img_array, _bch_extract_ids,
-                                      time_budget=RESYNC_BUDGET_S)
-    return recovered
+                                      time_budget=time_budget)
+    return dict(recovered, checked=True) if recovered else None
+
+
+# How far an upload's aspect ratio may sit from a record's and still be tried at
+# that record's size. Sharing apps scale both sides together - WhatsApp sent a
+# 4419x6250 photo on as 1131x1600, 0.02% off - so this only has to absorb
+# rounding and a screenshot's few-pixel crop.
+LOOKUP_ASPECT_TOLERANCE = 0.02
+
+
+def _lookup_by_record_size(img: np.ndarray, deadline: float) -> dict | None:
+    """Find the record a resized copy belongs to, using the sizes on record.
+
+    A blind read has to authenticate itself, and the only self-check the
+    payload carries is the BCH integrity tag.  On a shrunk copy BCH fails even
+    at the correct size: a 1536x2048 photo shrunk to 1200x1600 decoded nothing
+    through BCH, at its own size or restored, while the majority vote read both
+    ids correctly once the original size was restored.  The vote has no check
+    of its own, so it cannot be trusted alone - but a record can check it.
+
+    So each image record whose shape matches the upload is tried as the answer:
+    restore the copy to that record's size, vote, and accept only when both ids
+    equal that record's keys exactly.  An exact match against one specific
+    record does not happen by chance, so this cannot name a wrong owner the way
+    an unchecked vote can.
+
+    Two passes keep it inside the budget when many records share a shape (every
+    3:4 phone photo does): each candidate at zero offset first, one oracle call
+    that covers a shared photo, then the full offset scan for a cropped one.
+    """
+    h, w = img.shape[:2]
+    rows = (
+        supabase.table("watermarks")
+        .select("id, owner, media, kind, metadata, owner_key, media_key")
+        .eq("kind", "image")
+        .execute()
+    ).data or []
+
+    cands = []
+    for r in rows:
+        meta = r.get("metadata") or {}
+        if not meta.get("width") or not meta.get("height"):
+            continue                      # predates stored dimensions
+        known = (int(meta["width"]), int(meta["height"]))
+        if known == (w, h):
+            continue                      # grid never moved; the blind read covered it
+        off = abs((known[0] / known[1]) / (w / h) - 1.0)
+        if off <= LOOKUP_ASPECT_TOLERANCE:
+            # The oracle needs the encoder's repeat counts; without them it is
+            # None and every candidate goes straight to the exact check.
+            oracle = (_make_geometry_oracle(meta)
+                      if "meta_bits_coded" in meta and "owner_id" in meta else None)
+            cands.append((off, known, oracle, r))
+    cands.sort(key=lambda c: c[0])
+
+    def confirmed(r: dict, transform: dict) -> bool:
+        ids = _blind_extract_ids(apply_transform(img, transform))
+        return bool(ids) and (ids["owner_id"].lower(), ids["media_id"].lower()) \
+            == (r["owner_key"], r["media_key"])
+
+    for _, known, oracle, r in cands:
+        if time.monotonic() > deadline:
+            return None
+        cand = {"width": known[0], "height": known[1], "dx": 0, "dy": 0}
+        if oracle is not None:
+            strip = apply_transform(img, cand, max_rows=oracle.rows_needed(known[0]))
+            if not oracle(strip):
+                continue
+        if confirmed(r, cand):
+            return r
+
+    for _, known, oracle, r in cands:
+        if oracle is None or time.monotonic() > deadline:
+            continue
+        best = _best_known_geometry(img, oracle, known, deadline)
+        if best and confirmed(r, best):
+            return r
+    return None
 
 
 @app.post("/lookup")
@@ -1105,12 +1186,6 @@ async def lookup(file: UploadFile = File(...)):
         finally:
             tmp_path.unlink(missing_ok=True)
 
-    if not parsed:
-        raise HTTPException(404, "Could not extract watermark from this file")
-
-    owner_id = parsed["owner_id"]
-    media_id = parsed["media_id"]
-
     # Match on the exact embedded 8-byte key (lowercased), unique per owner via
     # the index from migration 002.  This is what the watermark actually
     # carries, so resolution is unambiguous — no prefix over-matching where one
@@ -1121,40 +1196,49 @@ async def lookup(file: UploadFile = File(...)):
     # short_id, so it identifies exactly one account.  Files encoded before it
     # carry an email prefix and remain resolvable through their original row —
     # which is why 003 does not rewrite historic owner_keys.
-    owner_key = owner_id.lower()
-    media_key = media_id.lower()
-    res = (
-        supabase.table("watermarks")
-        .select("*")
-        .eq("owner_key", owner_key)
-        .eq("media_key", media_key)
-        .execute()
-    )
+    def find(ids: dict) -> dict | None:
+        res = (
+            supabase.table("watermarks")
+            .select("*")
+            .eq("owner_key", ids["owner_id"].lower())
+            .eq("media_key", ids["media_id"].lower())
+            .execute()
+        )
+        return res.data[0] if res.data else None
 
-    if not res.data and kind == "image":
-        # Nothing matched, so the ids read out of the pixels are suspect — most
-        # often because the upload is a screenshot and the grid they came from
-        # has moved.  Search for the real geometry and ask once more.
-        retry = _resync_extract_ids(img)
-        if retry and (retry["owner_id"].lower(), retry["media_id"].lower())                 != (owner_key, media_key):
-            owner_id, media_id = retry["owner_id"], retry["media_id"]
-            owner_key, media_key = owner_id.lower(), media_id.lower()
-            res = (
-                supabase.table("watermarks")
-                .select("*")
-                .eq("owner_key", owner_key)
-                .eq("media_key", media_key)
-                .execute()
+    record = find(parsed) if parsed else None
+
+    if record is None and kind == "image":
+        # Nothing matched, so the ids read out of the pixels are suspect — the
+        # grid they came from has most likely moved (a shared photo shrunk by
+        # the app, or a screenshot).  This used to stop at once when the read
+        # returned nothing at all; a moved grid is exactly when it does.
+        deadline = time.monotonic() + RESYNC_BUDGET_S
+        record = _lookup_by_record_size(img, deadline)
+        if record is None and time.monotonic() < deadline:
+            retry = _resync_extract_ids(img, time_budget=deadline - time.monotonic())
+            if retry:
+                parsed = retry
+                record = find(retry)
+
+    if record is None:
+        if parsed and parsed.get("checked"):
+            raise HTTPException(
+                404,
+                f"No database record for owner={parsed['owner_id']!r} "
+                f"media={parsed['media_id']!r}. These ids were read and verified "
+                f"from the watermark — check they match your encode inputs."
             )
-
-    if not res.data:
+        # An unchecked vote off a moved grid is arbitrary bytes, so quoting it
+        # as "extracted from the watermark" would send the user to compare
+        # garbage against their encode inputs.
         raise HTTPException(
             404,
-            f"No database record for owner={owner_id!r} media={media_id!r}. "
-            f"Extracted from watermark — check these match your encode inputs."
+            "Could not read the owner and media IDs from this file. If it was "
+            "resized or recompressed (for example, shared through a messaging "
+            "app), its record could not be matched by size either."
         )
 
-    record = res.data[0]
     return {
         "id":       record["id"],
         "owner":    record["owner"],
@@ -1550,7 +1634,7 @@ def _tamper_reasons(v: dict) -> list:
     reasons = []
     if v.get("content_tampered"):
         n = int(v.get("n_blocks_tampered", 0))
-        reasons.append(f"{n} image region{'s' if n != 1 else ''} were modified")
+        reasons.append(f"{n} image region{'s were' if n != 1 else ' was'} modified")
     if not v.get("owner_match"):
         reasons.append("the owner ID could not be matched")
     if not v.get("media_match"):
@@ -1562,18 +1646,40 @@ def _tamper_reasons(v: dict) -> list:
     return reasons
 
 
-def _resync_reason(resync: dict, width: int, height: int) -> str:
-    """Describe, in the user's terms, what had to be undone to read the file."""
+def _resync_reason(resync: dict, width: int, height: int, ids_read: bool) -> str:
+    """Describe, in the user's terms, what had to be undone to read the file.
+
+    The restored size is the original's, so the sentence runs original -> copy.
+    A shrunk copy is named as sharing rather than as a screenshot: messaging
+    apps cap the long side (WhatsApp sent a 4419x6250 photo on as 1131x1600),
+    and calling that a screenshot sends the user looking for the wrong cause.
+
+    A geometry is only accepted once the grid agrees with the expected ids
+    (GEOMETRY_BIT_AGREEMENT), so a resync always means the watermark WAS found.
+    When the ids still fail after restoring, say that it was found but too
+    damaged - not that it is missing, which would suggest an unprotected file.
+    """
+    orig_w, orig_h = int(resync["width"]), int(resync["height"])
+    dx, dy = int(resync.get("dx", 0)), int(resync.get("dy", 0))
+    # The restore pads by (dx, dy) and THEN resizes to the original, so the
+    # scale is judged on the padded size. Judged on the raw size, a 3px crop
+    # read as "shrunk from 3072x2048 to 3069x2048".
+    scale = orig_w / max(1, int(width) + dx)
     parts = []
-    if (int(resync["width"]), int(resync["height"])) != (int(width), int(height)):
-        parts.append(f"rescaled from {width}x{height} to "
-                     f"{int(resync['width'])}x{int(resync['height'])}")
-    if resync.get("dx") or resync.get("dy"):
-        parts.append(f"cropped by {int(resync['dx'])}px left, "
-                     f"{int(resync['dy'])}px top")
+    if abs(scale - 1.0) > 0.01:
+        verb = "shrunk" if scale > 1.0 else "enlarged"
+        parts.append(f"{verb} from the original {orig_w}x{orig_h} to {width}x{height}")
+    if dx or dy:
+        parts.append(f"cropped by {dx}px left, {dy}px top")
     what = " and ".join(parts) if parts else "geometrically altered"
-    return (f"this copy was {what} - typical of a screenshot; "
-            "the watermark was read after restoring the original geometry")
+    if parts and parts[0].startswith("shrunk"):
+        cause = "as messaging apps and websites do to shared photos"
+    else:
+        cause = "typical of a screenshot"
+    found = ("the watermark was read after restoring the original size" if ids_read else
+             "the watermark was found after restoring the original size, "
+             "but was too damaged to read the IDs")
+    return f"this copy was {what}, {cause}; {found}"
 
 
 def _shape_image_response(v: dict, filename: str, width: int, height: int,
@@ -1603,7 +1709,9 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int,
         # had to be geometrically restored before it could be read at all, and
         # without that context a "tampered" verdict on someone's own screenshot
         # reads as an accusation rather than as a description of resampling.
-        reasons.insert(0, _resync_reason(resync, width, height))
+        reasons.insert(0, _resync_reason(
+            resync, width, height,
+            ids_read=bool(v.get("owner_match") or v.get("media_match"))))
 
     return {
         "status":          "tampered" if v["tampered"] else "authentic",

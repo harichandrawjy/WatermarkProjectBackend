@@ -295,11 +295,17 @@ def _decode_id_fixed(b: bytes) -> str:
     `errors='replace'` keeps decoding robust when a truncated multi-byte
     sequence remains at the tail (recovery still surfaces something
     rather than throwing)."""
-    # Drop control characters, not just the trailing NUL padding. A failed
-    # recovery returns arbitrary bytes, and a NUL in the middle survives
-    # rstrip; Postgres then rejects the archived verdict with SQLSTATE 22P05
-    # and the whole history row is lost over a meaningless value.
-    decoded = b.rstrip(b'\x00').decode('utf-8', errors='replace')
+    # An id is text and never contains NUL, so the FIRST NUL is where it ends;
+    # everything after is padding. Stripping only TRAILING NULs let a bit
+    # flipped inside the padding join the id: one flip turns NUL into a space
+    # (0x00 -> 0x20), and a 1536x2048 photo shrunk to 1200x1600 read media
+    # "arc" back as "arc " - shown identically, compared unequal, verdict
+    # tampered.  Measured: that copy matches both ids once cut at the first NUL.
+    #
+    # Control characters are still dropped from what remains. A failed
+    # recovery returns arbitrary bytes; Postgres rejects a control character in
+    # the archived verdict with SQLSTATE 22P05 and the history row is lost.
+    decoded = b.split(b'\x00', 1)[0].decode('utf-8', errors='replace')
     return ''.join(ch for ch in decoded if ch.isprintable())
 
 
