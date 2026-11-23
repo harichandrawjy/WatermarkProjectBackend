@@ -32,8 +32,16 @@ What it measures
 
 Run:  python eval/robustness_eval.py
 Out:  eval/results/{attacks.csv, threshold_sweep.csv, summary.md}
+
+Fixed-resolution benchmark (every image the same size, no synthetic extras):
+      python eval/robustness_eval.py --images eval/datasets/kodak --size 512 \
+             --no-synthetic --out eval/results_kodak512
+      Each source is centre-cropped to a square, then downscaled to --size if it
+      is larger, so no image is ever upscaled.  The Kodak set (24 PNGs,
+      https://r0k.us/graphics/kodak/) crops to exactly 512x512 with no resampling.
 """
 
+import argparse
 import csv
 import hashlib
 import io
@@ -168,6 +176,18 @@ def _small_edit(a):
     return o, [(y0, y0 + 32, x0, x0 + 32)]
 
 
+def _cover(a, frac):
+    """Large-area replacement: the bottom `frac` of the image painted flat.
+
+    Probes the point where so much is replaced that the robust identity layer
+    can no longer be read, while the fragile layer should still flag the area.
+    """
+    o = a.copy(); h, w = a.shape[:2]
+    y0 = h - int(round(h * frac))
+    o[y0:, :] = 128
+    return o, [(y0, h, 0, w)]
+
+
 # (label, fn, expectation)  expectation: "authentic" | "tampered"
 ATTACKS = [
     ("none (control)",        lambda a: (a, None),        "authentic"),
@@ -189,6 +209,8 @@ ATTACKS = [
     ("splice / copy-move",    _splice,                    "tampered"),
     ("blank region",          _blank,                     "tampered"),
     ("single 32x32 edit",     _small_edit,                "tampered"),
+    ("cover 25% of area",     lambda a: _cover(a, 0.25),  "tampered"),
+    ("cover 50% of area",     lambda a: _cover(a, 0.50),  "tampered"),
 ]
 
 
@@ -255,7 +277,7 @@ def _already_watermarked(arr: np.ndarray) -> bool:
     return False
 
 
-def load_sources(include_synthetic=True):
+def load_sources(include_synthetic=True, folder=None, size=0):
     """Load the operator-supplied test set from eval/images/.
 
     Three guards, each covering a way the sample can be quietly invalidated:
@@ -270,7 +292,7 @@ def load_sources(include_synthetic=True):
     the summary can report real photos separately.
     """
     out, seen_hashes, rejected = [], set(), []
-    folder = HERE / "images"
+    folder = Path(folder) if folder else HERE / "images"
 
     for f in sorted(folder.glob("*")):
         if f.suffix.lower() not in (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".avif", ".tif", ".tiff"):
@@ -283,7 +305,14 @@ def load_sources(include_synthetic=True):
         if min(im.size) < 512:
             rejected.append((f.name, f"too small ({im.size[0]}x{im.size[1]}, need 512 short side)")); continue
 
-        if max(im.size) > MAX_DIM:
+        if size:
+            # Fixed resolution: centre square crop, then downscale only.
+            s = min(im.size)
+            x0, y0 = (im.size[0] - s) // 2, (im.size[1] - s) // 2
+            im = im.crop((x0, y0, x0 + s, y0 + s))
+            if s > size:
+                im = im.resize((size, size), Image.LANCZOS)
+        elif max(im.size) > MAX_DIM:
             r = MAX_DIM / max(im.size)
             im = im.resize((int(im.size[0] * r), int(im.size[1] * r)), Image.LANCZOS)
 
@@ -329,7 +358,20 @@ def load_sources(include_synthetic=True):
 # ──────────────────────────────────────────────────────────────
 
 def main():
-    sources = load_sources()
+    global RESULTS
+    ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
+    ap.add_argument("--images", help="source folder (default: eval/images)")
+    ap.add_argument("--size", type=int, default=0,
+                    help="square side in px; every image cropped/downscaled to it")
+    ap.add_argument("--no-synthetic", action="store_true",
+                    help="leave out the two synthetic stress images")
+    ap.add_argument("--out", help="results folder (default: eval/results)")
+    args = ap.parse_args()
+    if args.out:
+        RESULTS = Path(args.out).resolve()
+        RESULTS.mkdir(parents=True, exist_ok=True)
+
+    sources = load_sources(not args.no_synthetic, args.images, args.size)
     n_photo = sum(1 for _, _, k in sources if k == "photo")
     print(f"accepted sources: {len(sources)}  ({n_photo} photographs, "
           f"{len(sources)-n_photo} synthetic)")
@@ -394,11 +436,13 @@ def main():
             print(f"    {mark} {label:22s} {got:9s} blocks={int(v['n_blocks_tampered']):>4d}"
                   + (f"  F1={f1:.3f}" if rects and not np.isnan(f1) else ""))
 
-    _write(rows, sweep_rows, quality)
+    setup = (f"Sources: {args.images or 'eval/images'}"
+             + (f", every image centre-cropped to {args.size}x{args.size}" if args.size else ""))
+    _write(rows, sweep_rows, quality, setup)
     print(f"\ndone in {time.time()-t_start:.0f}s -> {RESULTS}")
 
 
-def _write(rows, sweep_rows, quality):
+def _write(rows, sweep_rows, quality, setup=""):
     with open(RESULTS / "attacks.csv", "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=list(rows[0].keys())); w.writeheader(); w.writerows(rows)
     with open(RESULTS / "threshold_sweep.csv", "w", newline="", encoding="utf-8") as f:
@@ -414,6 +458,7 @@ def _write(rows, sweep_rows, quality):
     lines = ["# Watermark evaluation", "",
              f"{n_photo} photographs + {n_img - n_photo} synthetic images "
              f"x {len(ATTACKS)} operations = {len(rows)} verifications.", "",
+             *([setup + ".", ""] if setup else []),
              "Sources are checked before use: anything already carrying a watermark is",
              "refused, and byte-identical duplicates are dropped, so no image can be",
              "double-watermarked or silently counted twice.", "",

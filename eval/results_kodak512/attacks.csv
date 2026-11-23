@@ -1,0 +1,505 @@
+image,kind,attack,expected,verdict,correct,owner_match,media_match,ber_bits,blocks_flagged,blocks_total,loc_precision,loc_recall,loc_f1
+kodim01,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,JPEG q50,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim01,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim01,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim01,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim01,photo,splice / copy-move,tampered,tampered,1,1,1,0.01367,5,256,1.0,0.5556,0.7143
+kodim01,photo,blank region,tampered,tampered,1,1,1,0.01074,3,256,1.0,0.3333,0.5
+kodim01,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim01,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim01,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim02,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,JPEG q50,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim02,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim02,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim02,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim02,photo,splice / copy-move,tampered,tampered,1,1,1,0.01074,3,256,1.0,0.3333,0.5
+kodim02,photo,blank region,tampered,tampered,1,1,0,0.01758,5,256,1.0,0.5556,0.7143
+kodim02,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim02,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim02,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim03,photo,none (control),authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,PNG re-save,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,JPEG q95,authentic,tampered,0,1,1,0.00586,1,256,,,
+kodim03,photo,JPEG q90,authentic,tampered,0,1,1,0.00781,2,256,,,
+kodim03,photo,JPEG q80,authentic,tampered,0,1,1,0.01074,4,256,,,
+kodim03,photo,JPEG q70,authentic,tampered,0,1,1,0.01367,5,256,,,
+kodim03,photo,JPEG q60,authentic,tampered,0,1,1,0.01562,4,256,,,
+kodim03,photo,JPEG q50,authentic,tampered,0,0,0,0.01953,5,256,,,
+kodim03,photo,noise sigma=1,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,noise sigma=3,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,noise sigma=5,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim03,photo,resize 0.75x,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,resize 0.5x,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim03,photo,brightness +1,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,brightness +5,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim03,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim03,photo,splice / copy-move,tampered,tampered,1,0,1,0.01758,7,256,1.0,0.7778,0.875
+kodim03,photo,blank region,tampered,tampered,1,1,0,0.02344,9,256,1.0,1.0,1.0
+kodim03,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00488,1,256,1.0,1.0,1.0
+kodim03,photo,cover 25% of area,tampered,tampered,1,0,0,0.12109,42,256,1.0,0.6562,0.7925
+kodim03,photo,cover 50% of area,tampered,tampered,1,0,0,0.24121,82,256,1.0,0.6406,0.781
+kodim04,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,JPEG q50,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim04,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim04,photo,splice / copy-move,tampered,tampered,1,0,1,0.00684,0,256,,0.0,
+kodim04,photo,blank region,tampered,tampered,1,1,0,0.0127,4,256,1.0,0.4444,0.6154
+kodim04,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim04,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim04,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim05,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,JPEG q90,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim05,photo,JPEG q80,authentic,authentic,1,1,1,0.00391,0,256,,,
+kodim05,photo,JPEG q70,authentic,authentic,1,1,1,0.00879,0,256,,,
+kodim05,photo,JPEG q60,authentic,authentic,1,1,1,0.00684,0,256,,,
+kodim05,photo,JPEG q50,authentic,tampered,0,0,0,0.00879,0,256,,,
+kodim05,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim05,photo,resize 0.5x,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim05,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,brightness +5,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim05,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim05,photo,splice / copy-move,tampered,tampered,1,0,1,0.01367,5,256,1.0,0.5556,0.7143
+kodim05,photo,blank region,tampered,tampered,1,1,0,0.0127,3,256,1.0,0.3333,0.5
+kodim05,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim05,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim05,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim06,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,JPEG q80,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim06,photo,JPEG q70,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim06,photo,JPEG q60,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim06,photo,JPEG q50,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim06,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim06,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim06,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim06,photo,brightness +5,authentic,tampered,0,0,1,0.0332,10,256,,,
+kodim06,photo,contrast x1.01,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim06,photo,splice / copy-move,tampered,tampered,1,0,1,0.01465,4,256,1.0,0.4444,0.6154
+kodim06,photo,blank region,tampered,tampered,1,1,0,0.00977,3,256,1.0,0.3333,0.5
+kodim06,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim06,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim06,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim07,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,JPEG q80,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim07,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,JPEG q60,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim07,photo,JPEG q50,authentic,authentic,1,1,1,0.00293,0,256,,,
+kodim07,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim07,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim07,photo,splice / copy-move,tampered,tampered,1,0,1,0.01074,3,256,1.0,0.3333,0.5
+kodim07,photo,blank region,tampered,tampered,1,1,0,0.01074,2,256,1.0,0.2222,0.3636
+kodim07,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim07,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim07,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim08,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,JPEG q70,authentic,tampered,0,1,0,0.00098,0,256,,,
+kodim08,photo,JPEG q60,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim08,photo,JPEG q50,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim08,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim08,photo,resize 0.5x,authentic,tampered,0,0,0,0.00195,0,256,,,
+kodim08,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim08,photo,brightness +5,authentic,tampered,0,0,0,0.00293,0,256,,,
+kodim08,photo,contrast x1.01,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim08,photo,splice / copy-move,tampered,tampered,1,1,1,0.01367,4,256,1.0,0.4444,0.6154
+kodim08,photo,blank region,tampered,tampered,1,1,0,0.00977,2,256,1.0,0.2222,0.3636
+kodim08,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim08,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim08,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim09,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,JPEG q95,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim09,photo,JPEG q90,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim09,photo,JPEG q80,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim09,photo,JPEG q70,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim09,photo,JPEG q60,authentic,tampered,0,0,1,0.00293,0,256,,,
+kodim09,photo,JPEG q50,authentic,tampered,0,0,0,0.00684,2,256,,,
+kodim09,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim09,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim09,photo,splice / copy-move,tampered,tampered,1,1,1,0.01074,3,256,1.0,0.3333,0.5
+kodim09,photo,blank region,tampered,tampered,1,1,1,0.0127,3,256,1.0,0.3333,0.5
+kodim09,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim09,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim09,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim10,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,JPEG q80,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim10,photo,JPEG q70,authentic,tampered,0,1,0,0.0,0,256,,,
+kodim10,photo,JPEG q60,authentic,tampered,0,0,1,0.00098,0,256,,,
+kodim10,photo,JPEG q50,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim10,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim10,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim10,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim10,photo,contrast x1.01,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim10,photo,splice / copy-move,tampered,tampered,1,1,1,0.00781,3,256,1.0,0.3333,0.5
+kodim10,photo,blank region,tampered,tampered,1,1,1,0.01465,4,256,1.0,0.4444,0.6154
+kodim10,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim10,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim10,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim11,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,JPEG q70,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim11,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,JPEG q50,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim11,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim11,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim11,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim11,photo,splice / copy-move,tampered,tampered,1,0,1,0.01074,2,256,1.0,0.2222,0.3636
+kodim11,photo,blank region,tampered,tampered,1,1,1,0.01367,5,256,1.0,0.5556,0.7143
+kodim11,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim11,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim11,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim12,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,JPEG q50,authentic,tampered,0,0,0,0.00195,0,256,,,
+kodim12,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim12,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim12,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,brightness +5,authentic,tampered,0,0,1,0.01172,3,256,,,
+kodim12,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim12,photo,splice / copy-move,tampered,tampered,1,0,1,0.0127,4,256,1.0,0.4444,0.6154
+kodim12,photo,blank region,tampered,tampered,1,1,1,0.00879,2,256,1.0,0.2222,0.3636
+kodim12,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim12,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim12,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim13,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,JPEG q70,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim13,photo,JPEG q60,authentic,tampered,0,0,1,0.0,0,256,,,
+kodim13,photo,JPEG q50,authentic,tampered,0,0,0,0.00293,0,256,,,
+kodim13,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim13,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim13,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,brightness +5,authentic,tampered,0,0,1,0.00293,1,256,,,
+kodim13,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim13,photo,splice / copy-move,tampered,tampered,1,0,1,0.01074,5,256,1.0,0.5556,0.7143
+kodim13,photo,blank region,tampered,tampered,1,1,1,0.01758,5,256,1.0,0.5556,0.7143
+kodim13,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim13,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim13,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim14,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,JPEG q95,authentic,tampered,0,1,1,0.00781,1,256,,,
+kodim14,photo,JPEG q90,authentic,tampered,0,1,1,0.01172,1,256,,,
+kodim14,photo,JPEG q80,authentic,tampered,0,1,1,0.01172,1,256,,,
+kodim14,photo,JPEG q70,authentic,tampered,0,1,1,0.02344,4,256,,,
+kodim14,photo,JPEG q60,authentic,tampered,0,1,1,0.02246,3,256,,,
+kodim14,photo,JPEG q50,authentic,tampered,0,1,1,0.02734,3,256,,,
+kodim14,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim14,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim14,photo,splice / copy-move,tampered,tampered,1,0,1,0.01074,4,256,1.0,0.4444,0.6154
+kodim14,photo,blank region,tampered,tampered,1,1,0,0.0166,7,256,1.0,0.7778,0.875
+kodim14,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim14,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim14,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim15,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,JPEG q50,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim15,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim15,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,brightness +5,authentic,authentic,1,1,1,0.00488,0,256,,,
+kodim15,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim15,photo,splice / copy-move,tampered,tampered,1,0,1,0.01367,5,256,1.0,0.5556,0.7143
+kodim15,photo,blank region,tampered,tampered,1,1,1,0.0127,3,256,1.0,0.3333,0.5
+kodim15,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim15,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim15,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim16,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q60,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,JPEG q50,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim16,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim16,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim16,photo,splice / copy-move,tampered,tampered,1,1,1,0.01367,5,256,1.0,0.5556,0.7143
+kodim16,photo,blank region,tampered,tampered,1,1,0,0.01367,4,256,1.0,0.4444,0.6154
+kodim16,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim16,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim16,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim17,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,JPEG q60,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim17,photo,JPEG q50,authentic,tampered,0,0,0,0.00195,0,256,,,
+kodim17,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim17,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim17,photo,splice / copy-move,tampered,tampered,1,1,1,0.01074,3,256,1.0,0.3333,0.5
+kodim17,photo,blank region,tampered,tampered,1,1,0,0.01367,4,256,1.0,0.4444,0.6154
+kodim17,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim17,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim17,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim18,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,JPEG q70,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim18,photo,JPEG q60,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim18,photo,JPEG q50,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim18,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim18,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,brightness +5,authentic,tampered,0,1,0,0.0,0,256,,,
+kodim18,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim18,photo,splice / copy-move,tampered,tampered,1,0,1,0.01562,4,256,1.0,0.4444,0.6154
+kodim18,photo,blank region,tampered,tampered,1,1,1,0.01074,3,256,1.0,0.3333,0.5
+kodim18,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim18,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim18,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim19,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,JPEG q95,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim19,photo,JPEG q90,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim19,photo,JPEG q80,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim19,photo,JPEG q70,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim19,photo,JPEG q60,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim19,photo,JPEG q50,authentic,authentic,1,1,1,0.00391,0,256,,,
+kodim19,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim19,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim19,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim19,photo,splice / copy-move,tampered,tampered,1,1,1,0.01074,2,256,1.0,0.2222,0.3636
+kodim19,photo,blank region,tampered,tampered,1,1,0,0.01172,3,256,1.0,0.3333,0.5
+kodim19,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim19,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim19,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim20,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim20,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim20,photo,JPEG q95,authentic,tampered,0,0,1,0.00586,2,256,,,
+kodim20,photo,JPEG q90,authentic,tampered,0,0,0,0.00781,1,256,,,
+kodim20,photo,JPEG q80,authentic,tampered,0,0,0,0.00879,1,256,,,
+kodim20,photo,JPEG q70,authentic,tampered,0,0,0,0.00586,1,256,,,
+kodim20,photo,JPEG q60,authentic,tampered,0,0,0,0.00977,2,256,,,
+kodim20,photo,JPEG q50,authentic,tampered,0,0,0,0.01855,4,256,,,
+kodim20,photo,noise sigma=1,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim20,photo,noise sigma=3,authentic,tampered,0,0,1,0.00586,1,256,,,
+kodim20,photo,noise sigma=5,authentic,tampered,0,0,0,0.00684,2,256,,,
+kodim20,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim20,photo,resize 0.5x,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim20,photo,brightness +1,authentic,tampered,0,0,1,0.00684,2,256,,,
+kodim20,photo,brightness +5,authentic,tampered,0,0,0,0.15039,41,256,,,
+kodim20,photo,contrast x1.01,authentic,tampered,0,0,0,0.0127,3,256,,,
+kodim20,photo,splice / copy-move,tampered,tampered,1,1,1,0.00781,2,256,1.0,0.2222,0.3636
+kodim20,photo,blank region,tampered,tampered,1,1,0,0.01367,3,256,1.0,0.3333,0.5
+kodim20,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim20,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim20,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim21,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,JPEG q95,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,JPEG q90,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,JPEG q80,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,JPEG q70,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,JPEG q60,authentic,authentic,1,1,1,0.00098,0,256,,,
+kodim21,photo,JPEG q50,authentic,tampered,0,0,0,0.00195,0,256,,,
+kodim21,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim21,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,brightness +5,authentic,tampered,0,0,0,0.00488,1,256,,,
+kodim21,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim21,photo,splice / copy-move,tampered,tampered,1,1,1,0.00977,3,256,1.0,0.3333,0.5
+kodim21,photo,blank region,tampered,tampered,1,1,1,0.01465,5,256,1.0,0.5556,0.7143
+kodim21,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim21,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim21,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim22,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,JPEG q95,authentic,tampered,0,1,0,0.0,0,256,,,
+kodim22,photo,JPEG q90,authentic,tampered,0,1,0,0.0,0,256,,,
+kodim22,photo,JPEG q80,authentic,tampered,0,0,0,0.00293,0,256,,,
+kodim22,photo,JPEG q70,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim22,photo,JPEG q60,authentic,tampered,0,0,0,0.00586,0,256,,,
+kodim22,photo,JPEG q50,authentic,tampered,0,0,0,0.0127,1,256,,,
+kodim22,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,resize 0.75x,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,resize 0.5x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim22,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,brightness +5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,contrast x1.01,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim22,photo,splice / copy-move,tampered,tampered,1,0,1,0.01172,3,256,1.0,0.3333,0.5
+kodim22,photo,blank region,tampered,tampered,1,1,1,0.01465,5,256,1.0,0.5556,0.7143
+kodim22,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim22,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim22,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
+kodim23,photo,none (control),authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim23,photo,PNG re-save,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim23,photo,JPEG q95,authentic,tampered,0,1,1,0.01074,3,256,,,
+kodim23,photo,JPEG q90,authentic,tampered,0,1,1,0.01172,3,256,,,
+kodim23,photo,JPEG q80,authentic,tampered,0,1,1,0.0127,3,256,,,
+kodim23,photo,JPEG q70,authentic,tampered,0,1,1,0.01465,2,256,,,
+kodim23,photo,JPEG q60,authentic,tampered,0,1,1,0.01172,2,256,,,
+kodim23,photo,JPEG q50,authentic,tampered,0,1,1,0.02148,4,256,,,
+kodim23,photo,noise sigma=1,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim23,photo,noise sigma=3,authentic,authentic,1,1,1,0.00293,0,256,,,
+kodim23,photo,noise sigma=5,authentic,authentic,1,1,1,0.00684,0,256,,,
+kodim23,photo,resize 0.75x,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim23,photo,resize 0.5x,authentic,tampered,0,0,0,0.00195,0,256,,,
+kodim23,photo,brightness +1,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim23,photo,brightness +5,authentic,authentic,1,1,1,0.00488,0,256,,,
+kodim23,photo,contrast x1.01,authentic,authentic,1,1,1,0.00293,0,256,,,
+kodim23,photo,splice / copy-move,tampered,tampered,1,0,1,0.01562,5,256,1.0,0.5556,0.7143
+kodim23,photo,blank region,tampered,tampered,1,1,0,0.02246,8,256,1.0,0.8889,0.9412
+kodim23,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00586,1,256,1.0,1.0,1.0
+kodim23,photo,cover 25% of area,tampered,tampered,1,0,0,0.12207,42,256,1.0,0.6562,0.7925
+kodim23,photo,cover 50% of area,tampered,tampered,1,0,0,0.24121,82,256,1.0,0.6406,0.781
+kodim24,photo,none (control),authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,PNG re-save,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,JPEG q95,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim24,photo,JPEG q90,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim24,photo,JPEG q80,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim24,photo,JPEG q70,authentic,tampered,0,0,0,0.00098,0,256,,,
+kodim24,photo,JPEG q60,authentic,tampered,0,0,0,0.00977,2,256,,,
+kodim24,photo,JPEG q50,authentic,tampered,0,0,0,0.00879,2,256,,,
+kodim24,photo,noise sigma=1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,noise sigma=3,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,noise sigma=5,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,resize 0.75x,authentic,tampered,0,0,0,0.0,0,256,,,
+kodim24,photo,resize 0.5x,authentic,tampered,0,0,0,0.00391,0,256,,,
+kodim24,photo,brightness +1,authentic,authentic,1,1,1,0.0,0,256,,,
+kodim24,photo,brightness +5,authentic,tampered,0,0,0,0.00879,2,256,,,
+kodim24,photo,contrast x1.01,authentic,authentic,1,1,1,0.00195,0,256,,,
+kodim24,photo,splice / copy-move,tampered,tampered,1,1,1,0.00781,2,256,1.0,0.2222,0.3636
+kodim24,photo,blank region,tampered,tampered,1,1,0,0.01465,4,256,1.0,0.4444,0.6154
+kodim24,photo,single 32x32 edit,tampered,tampered,1,1,1,0.00391,1,256,1.0,1.0,1.0
+kodim24,photo,cover 25% of area,tampered,tampered,1,0,0,0.12012,42,256,1.0,0.6562,0.7925
+kodim24,photo,cover 50% of area,tampered,tampered,1,0,0,0.24023,82,256,1.0,0.6406,0.781
