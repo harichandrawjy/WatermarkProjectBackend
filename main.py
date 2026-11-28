@@ -1646,6 +1646,56 @@ def _tamper_reasons(v: dict) -> list:
     return reasons
 
 
+_ID_CHECKS = ("owner_recovery", "media_recovery", "frame_recovery", "chain_recovery")
+
+
+def _image_status(v: dict) -> str:
+    """The verdict shown to the user: "authentic", "tampered" or "unverifiable".
+
+    The engine's `tampered` flag is a single OR, so a re-saved copy whose ids
+    were simply too damaged to read came out "tampered" exactly like an edited
+    one.  On the Kodak benchmark that was 70 of the 108 false alarms on harmless
+    processing (JPEG, resizing, brightness): ids unreadable, no region flagged.
+    Those are now "unverifiable": the file could not be confirmed either way.
+
+    It stays "tampered" when there is evidence: a modified region, or an id,
+    frame number or chain tag that BCH read back WITH a valid integrity tag but
+    that differs from the record (a different watermark, not noise).  A value
+    recovered only by majority vote carries no integrity tag, so a mismatch
+    there counts as unreadable.  "authentic" is unchanged: exactly when the
+    engine does not flag the file.
+    """
+    if not v["tampered"]:
+        return "authentic"
+    if v.get("content_tampered") or any(v.get(k) == "bch_mismatch" for k in _ID_CHECKS):
+        return "tampered"
+    return "unverifiable"
+
+
+def _unverifiable_reasons(v: dict) -> list:
+    """Why a file could not be confirmed, in the user's words."""
+    missing = [name for name, ok in (("owner ID", v.get("owner_match")), ("media ID", v.get("media_match"))) if not ok]
+    reasons = []
+    if missing:
+        reasons.append(f"the {' and '.join(missing)} could not be read back from the watermark")
+    reasons.append("no modified region was found, so this is not evidence of tampering")
+    return reasons
+
+
+def _resync_scale(resync: dict, width: int) -> float:
+    # The restore pads by (dx, dy) and THEN resizes to the original, so the
+    # scale is judged on the padded size.
+    return int(resync["width"]) / max(1, int(width) + int(resync.get("dx", 0)))
+
+
+def _resync_restored(resync: dict, width: int) -> bool:
+    """Whether the copy's size or position actually had to change.  The search
+    can settle on the file's own geometry (a compressed copy that was never
+    resized), and that must not be reported as a screenshot."""
+    return (abs(_resync_scale(resync, width) - 1.0) > 0.01
+            or bool(int(resync.get("dx", 0)) or int(resync.get("dy", 0))))
+
+
 def _resync_reason(resync: dict, width: int, height: int, ids_read: bool) -> str:
     """Describe, in the user's terms, what had to be undone to read the file.
 
@@ -1664,15 +1714,22 @@ def _resync_reason(resync: dict, width: int, height: int, ids_read: bool) -> str
     # The restore pads by (dx, dy) and THEN resizes to the original, so the
     # scale is judged on the padded size. Judged on the raw size, a 3px crop
     # read as "shrunk from 3072x2048 to 3069x2048".
-    scale = orig_w / max(1, int(width) + dx)
+    scale = _resync_scale(resync, width)
     parts = []
     if abs(scale - 1.0) > 0.01:
         verb = "shrunk" if scale > 1.0 else "enlarged"
         parts.append(f"{verb} from the original {orig_w}x{orig_h} to {width}x{height}")
     if dx or dy:
         parts.append(f"cropped by {dx}px left, {dy}px top")
-    what = " and ".join(parts) if parts else "geometrically altered"
-    if parts and parts[0].startswith("shrunk"):
+    if not parts:
+        # The search settled on the file's own size and position: nothing was
+        # rescaled or cropped (a heavily compressed copy, typically), so do not
+        # call it a screenshot.  The grid still agreed with the expected ids,
+        # which is what "found" means here.
+        return ("the watermark was found where it was embedded" if ids_read else
+                "the watermark was found, but it is too damaged to read the IDs")
+    what = " and ".join(parts)
+    if parts[0].startswith("shrunk"):
         cause = "as messaging apps and websites do to shared photos"
     else:
         cause = "typical of a screenshot"
@@ -1703,7 +1760,11 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int,
         (int(resync["width"]), int(resync["height"])) if resync else (width, height)
     )
 
-    reasons = _tamper_reasons(v) if v["tampered"] else []
+    status = _image_status(v)
+    reasons = (_tamper_reasons(v) if status == "tampered"
+               else _unverifiable_reasons(v) if status == "unverifiable" else [])
+    if resync and status == "unverifiable":
+        reasons = reasons[-1:]        # the resync line below already says the ids were unreadable
     if resync:
         # Say this first.  Everything else in the report describes a file that
         # had to be geometrically restored before it could be read at all, and
@@ -1714,7 +1775,7 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int,
             ids_read=bool(v.get("owner_match") or v.get("media_match"))))
 
     return {
-        "status":          "tampered" if v["tampered"] else "authentic",
+        "status":          status,
         # Measured, not synthesised: what fraction of the fragile watermark's
         # bits survived. No "confidence" score — see _tamper_reasons.
         "wmAccuracy":      max(0.0, min(1.0, 1.0 - ber_bits)),
@@ -1727,7 +1788,8 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int,
         "resynced":        ({"width":  int(resync["width"]),
                              "height": int(resync["height"]),
                              "offsetX": int(resync["dx"]),
-                             "offsetY": int(resync["dy"])} if resync else None),
+                             "offsetY": int(resync["dy"]),
+                             "restored": _resync_restored(resync, width)} if resync else None),
         "fileType":        "image",
         "fileName":        filename,
         "imageWidth":      int(map_width),
@@ -1764,6 +1826,34 @@ def _shape_image_response(v: dict, filename: str, width: int, height: int,
     }
 
 
+def _frame_status(pf: dict, flagged: bool) -> str:
+    """One frame's verdict, by the same rule as _image_status: a frame flagged
+    only because its ids could not be read (no modified region, no chain break,
+    no BCH payload naming someone else) is "unverifiable", not "tampered"."""
+    if not flagged:
+        return "authentic"
+    # reported_chain_tag is set only when BCH parsed a payload with a valid
+    # integrity tag, so an id mismatch alongside it is a different watermark.
+    if pf.get("content_tampered") or pf.get("self_chain_bad") or pf.get("reported_chain_tag") is not None:
+        return "tampered"
+    return "unverifiable"
+
+
+def _video_status(v: dict, frame_statuses: list) -> str:
+    """The clip's verdict.  Deleted, reordered, duplicated or truncated frames
+    are always "tampered"; a clip whose only problem is frames with unreadable
+    ids is "unverifiable".  Note that a frame whose number cannot be read at all
+    still shows up as a missing (deleted) frame, so heavy re-encoding usually
+    stays "tampered" - the sequence check cannot tell those apart."""
+    if not v["TAMPERED"]:
+        return "authentic"
+    temporal = bool(v.get("missing_frame_ids") or v.get("reordered")
+                    or v.get("duplicate_frame_ids") or v.get("truncated"))
+    if temporal or "tampered" in frame_statuses:
+        return "tampered"
+    return "unverifiable"
+
+
 def _shape_video_response(v: dict, filename: str) -> dict:
     temporal = v.get("temporal_tamper_map")
     if hasattr(temporal, "tolist"):
@@ -1794,7 +1884,7 @@ def _shape_video_response(v: dict, filename: str) -> dict:
         # rate; `blocksTampered` is how much of it was flagged.
         frame_results.append({
             "frame":           int(true_frame_idx),
-            "status":          "tampered" if t else "authentic",
+            "status":          _frame_status(pf, bool(t)),
             "ber":             float(pf.get("ber_lsb_sub", 0.0)),
             "blocksTampered":  int(pf.get("n_blocks_tampered", 0)),
             "blocksTotal":     int(pf.get("n_blocks_total", 0)),
@@ -1876,12 +1966,18 @@ def _shape_video_response(v: dict, filename: str) -> dict:
     if int(v.get("frames_truncated", 0)) > 2:
         reasons.append(f"{int(v['frames_truncated'])} frames truncated from the end")
 
+    status = _video_status(v, [r["status"] for r in frame_results])
+    if status == "unverifiable":
+        n_unread = sum(1 for r in frame_results if r["status"] == "unverifiable")
+        reasons = [f"the IDs of {n_unread} frame{'s' if n_unread != 1 else ''} could not be read back from the watermark",
+                   "no frame was modified, deleted or reordered, so this is not evidence of tampering"]
+
     return {
-        "status":          "tampered" if v["TAMPERED"] else "authentic",
+        "status":          status,
         "wmAccuracy":      max(0.0, min(1.0, 1.0 - ber_bits)),
         "ber":             ber_bits,
         "blockFlagRatio":  float(v["average_ber"]),
-        "reasons":         reasons if v["TAMPERED"] else [],
+        "reasons":         reasons if status != "authentic" else [],
         "fileType":        "video",
         "fileName":        filename,
         "tamperedRegions": [],
